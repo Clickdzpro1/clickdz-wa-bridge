@@ -1,0 +1,26 @@
+{
+  "name": "clickdz-wa-bridge",
+  "version": "1.0.0",
+  "description": "Multi-account WhatsApp QR bridge server (Baileys v7) for the ClickDZ copilot. Redis-backed auth state, HMAC-signed webhooks, HTTP admin API.",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "bridge",
+    "qr",
+    "clickdz"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "pino": "^10.3.1",
+    "qrcode": "^1.5.4"
+  }
+}

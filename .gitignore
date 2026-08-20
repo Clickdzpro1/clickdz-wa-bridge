@@ -1,0 +1,23 @@
+# dependencies
+node_modules/
+
+# local auth state (disk fallback) — NEVER commit WhatsApp session data
+auth_state/
+auth_*/
+auth_*
+
+# env / secrets — this repo is PUBLIC, keep all secrets out
+*.env
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+
+# os / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

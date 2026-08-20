@@ -1,0 +1,35 @@
+{
+  "_comment": "DigitalOcean App Platform spec for clickdz-wa-bridge. PRIMARY deploy target. Raw REST payload for POST https://api.digitalocean.com/v2/apps (Authorization: Bearer $DIGITALOCEAN_ACCESS_TOKEN); the DO skill does not wrap /v2/apps. Public git source => anonymous clone, NO GitHub OAuth/App install. Fill every env value marked <FILL:...> before POSTing; SECRET-typed values are stored encrypted by DO. Read back GET /v2/apps/{id} for .default_ingress (public URL) and .phase (ACTIVE). Update = PUT /v2/apps/{id} with the same spec (rebuilds from latest branch HEAD; deploy_on_push is not available on the anonymous git source).",
+  "spec": {
+    "name": "clickdz-wa-bridge",
+    "region": "fra",
+    "services": [
+      {
+        "name": "bridge",
+        "git": {
+          "repo_clone_url": "https://github.com/Clickdzpro1/clickdz-wa-bridge.git",
+          "branch": "main"
+        },
+        "source_dir": "/",
+        "environment_slug": "node-js",
+        "run_command": "node index.mjs",
+        "http_port": 8080,
+        "instance_size_slug": "apps-s-1vcpu-1gb",
+        "instance_count": 1,
+        "health_check": {
+          "http_path": "/health"
+        },
+        "envs": [
+          { "key": "BRIDGE_TOKEN", "value": "<FILL:SECRET>", "type": "SECRET", "scope": "RUN_TIME" },
+          { "key": "BRIDGE_WEBHOOK_SECRET", "value": "<FILL:SECRET>", "type": "SECRET", "scope": "RUN_TIME" },
+          { "key": "APP_WEBHOOK_URL", "value": "https://clickdzmax.vercel.app/api/whatsapp/bridge", "type": "GENERAL", "scope": "RUN_TIME" },
+          { "key": "KV_REST_API_URL", "value": "<FILL:SECRET>", "type": "SECRET", "scope": "RUN_TIME" },
+          { "key": "KV_REST_API_TOKEN", "value": "<FILL:SECRET>", "type": "SECRET", "scope": "RUN_TIME" },
+          { "key": "AUTH_STORE", "value": "redis", "type": "GENERAL", "scope": "RUN_TIME" },
+          { "key": "AUTH_STATE_PREFIX", "value": "wa:bridge:auth", "type": "GENERAL", "scope": "RUN_TIME" },
+          { "key": "LOG_LEVEL", "value": "info", "type": "GENERAL", "scope": "RUN_TIME" }
+        ]
+      }
+    ]
+  }
+}

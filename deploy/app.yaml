@@ -1,0 +1,57 @@
+# DigitalOcean App Platform spec (doctl variant) for clickdz-wa-bridge.
+# PRIMARY deploy target. Public git source => anonymous clone, no GitHub OAuth.
+#
+# Deploy with doctl:
+#   doctl apps create --spec deploy/app.yaml
+#   doctl apps update <app-id> --spec deploy/app.yaml    # update = rebuild from HEAD
+#   doctl apps get <app-id>                              # read default_ingress + phase
+#
+# Or POST deploy/do-app.json to https://api.digitalocean.com/v2/apps (raw REST).
+#
+# instance_count MUST stay 1: Baileys holds one live WebSocket per account
+# in-process; scaling out would create duplicate sockets (double sends, ban risk).
+# Scale UP (bigger instance), never OUT.
+name: clickdz-wa-bridge
+region: fra
+services:
+  - name: bridge
+    git:
+      repo_clone_url: https://github.com/Clickdzpro1/clickdz-wa-bridge.git
+      branch: main
+    source_dir: /
+    environment_slug: node-js
+    run_command: node index.mjs
+    http_port: 8080
+    instance_size_slug: apps-s-1vcpu-1gb
+    instance_count: 1
+    health_check:
+      http_path: /health
+    envs:
+      - key: BRIDGE_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+        value: "<FILL:SECRET>"
+      - key: BRIDGE_WEBHOOK_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "<FILL:SECRET>"
+      - key: APP_WEBHOOK_URL
+        scope: RUN_TIME
+        value: https://clickdzmax.vercel.app/api/whatsapp/bridge
+      - key: KV_REST_API_URL
+        scope: RUN_TIME
+        type: SECRET
+        value: "<FILL:SECRET>"
+      - key: KV_REST_API_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+        value: "<FILL:SECRET>"
+      - key: AUTH_STORE
+        scope: RUN_TIME
+        value: redis
+      - key: AUTH_STATE_PREFIX
+        scope: RUN_TIME
+        value: wa:bridge:auth
+      - key: LOG_LEVEL
+        scope: RUN_TIME
+        value: info
