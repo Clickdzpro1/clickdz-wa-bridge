@@ -15,6 +15,7 @@ import { makeAuthState } from './authState.mjs';
 const MAX_BACKOFF_MS = 60_000;
 const BASE_BACKOFF_MS = 2_000;
 const HISTORY_LIMIT = 2_000;
+const CHAT_LIMIT = 1_000;
 const S_WHATSAPP_NET = '@s.whatsapp.net';
 
 function digitsFromJid(jid) {
@@ -118,6 +119,14 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     return join(config.authDiskDir, 'history', `${safeSegment(instanceId)}.json`);
   }
 
+  function chatsKey(instanceId) {
+    return `${config.authStatePrefix}:chats:${instanceId}`;
+  }
+
+  function chatsDiskPath(instanceId) {
+    return join(config.authDiskDir, 'chats', `${safeSegment(instanceId)}.json`);
+  }
+
   async function readHistory(instanceId) {
     try {
       const raw =
@@ -144,6 +153,91 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     }
     await mkdir(join(config.authDiskDir, 'history'), { recursive: true });
     await writeFile(historyDiskPath(instanceId), body, { mode: 0o600 });
+  }
+
+  async function readChats(instanceId) {
+    try {
+      const raw =
+        config.authStore === 'redis'
+          ? await redis.get(chatsKey(instanceId))
+          : await readFile(chatsDiskPath(instanceId), 'utf8').catch((err) => {
+              if (err.code === 'ENOENT') return null;
+              throw err;
+            });
+      if (!raw) return [];
+      const value = JSON.parse(raw);
+      return Array.isArray(value) ? value.filter((item) => item && typeof item === 'object') : [];
+    } catch (err) {
+      logger.warn({ instanceId, err: err.message }, 'chat roster read failed');
+      return [];
+    }
+  }
+
+  async function writeChats(instanceId, chats) {
+    const body = JSON.stringify(chats.slice(0, CHAT_LIMIT));
+    if (config.authStore === 'redis') {
+      await redis.set(chatsKey(instanceId), body);
+      return;
+    }
+    await mkdir(join(config.authDiskDir, 'chats'), { recursive: true });
+    await writeFile(chatsDiskPath(instanceId), body, { mode: 0o600 });
+  }
+
+  function timestampFromAny(value) {
+    const raw =
+      typeof value === 'number'
+        ? value
+        : Number(value?.low ?? value?.toNumber?.() ?? value) || Math.floor(Date.now() / 1000);
+    const millis = raw < 10_000_000_000 ? raw * 1000 : raw;
+    const date = new Date(millis);
+    return Number.isNaN(date.valueOf()) ? new Date().toISOString() : date.toISOString();
+  }
+
+  function chatRecordFromWa(chat) {
+    const id = chat?.id || chat?.jid || chat?.remoteJid || '';
+    if (typeof id !== 'string' || !id.endsWith(S_WHATSAPP_NET)) return null;
+    const phone = digitsFromJid(id);
+    if (!phone) return null;
+    return {
+      id,
+      chatId: id,
+      chatJid: id,
+      chatPhone: phone,
+      phone,
+      name: chat.name || chat.notify || chat.verifiedName || phone,
+      lastMessageAt: timestampFromAny(
+        chat.lastMessageRecvTimestamp ?? chat.conversationTimestamp ?? chat.timestamp
+      ),
+      lastText: '',
+      messages: [],
+    };
+  }
+
+  async function mergeChats(session, rows) {
+    if (!Array.isArray(rows) || rows.length === 0) return 0;
+    const current = session.chats || (await readChats(session.id));
+    const byPhone = new Map(current.map((item) => [item.phone, item]));
+    let changed = 0;
+    for (const row of rows) {
+      const next = chatRecordFromWa(row);
+      if (!next) continue;
+      const existing = byPhone.get(next.phone);
+      byPhone.set(next.phone, {
+        ...existing,
+        ...next,
+        name: next.name || existing?.name || next.phone,
+        lastMessageAt: existing?.lastMessageAt && existing.lastMessageAt > next.lastMessageAt
+          ? existing.lastMessageAt
+          : next.lastMessageAt,
+      });
+      changed += 1;
+    }
+    const sorted = [...byPhone.values()]
+      .sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt))
+      .slice(0, CHAT_LIMIT);
+    session.chats = sorted;
+    await writeChats(session.id, sorted);
+    return changed;
   }
 
   function historyDedupKey(message) {
@@ -231,6 +325,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
 
   async function handleHistorySet(session, event) {
     const names = contactNamesFromHistory(event || {});
+    const chatCount = await mergeChats(session, event?.chats || []);
     let imported = 0;
     for (const msg of event?.messages || []) {
       try {
@@ -248,6 +343,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       {
         instanceId: session.id,
         imported,
+        chats: chatCount,
         received: Array.isArray(event?.messages) ? event.messages.length : 0,
         progress: event?.progress,
         isLatest: event?.isLatest,
@@ -267,7 +363,9 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
   async function listChats(id, { includeMessages = false, limit = 500 } = {}) {
     const history = await listMessages(id, HISTORY_LIMIT);
     if (!history) return null;
-    const chats = new Map();
+    const storedChats = sessions.get(id)?.chats || (await readChats(id));
+    if (sessions.get(id)) sessions.get(id).chats = storedChats;
+    const chats = new Map(storedChats.map((chat) => [chat.phone, { ...chat, messages: [] }]));
     for (const message of history) {
       const phone = message.chatPhone || digitsFromJid(message.chatJid);
       if (!phone) continue;
@@ -406,6 +504,16 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
         logger.error({ instanceId: session.id, err: err.message }, 'history handler crashed')
       );
     });
+    sock.ev.on('chats.upsert', (chats) => {
+      mergeChats(session, chats).catch((err) =>
+        logger.error({ instanceId: session.id, err: err.message }, 'chat upsert handler crashed')
+      );
+    });
+    sock.ev.on('chats.update', (chats) => {
+      mergeChats(session, chats).catch((err) =>
+        logger.error({ instanceId: session.id, err: err.message }, 'chat update handler crashed')
+      );
+    });
   }
 
   async function handleConnectionUpdate(session, update) {
@@ -530,6 +638,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       deleted: false,
       lastSendAt: 0,
       history: null,
+      chats: null,
     };
     sessions.set(id, session);
     if (options.persist !== false) await persistRegistry();
