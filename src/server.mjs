@@ -1,48 +1,50 @@
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
-import { timingSafeEqual } from 'node:crypto';
 
-// Bare node:http server — minimal deps, exact endpoints per spec.
+const MAX_BODY_BYTES = 1_000_000;
 
-const MAX_BODY_BYTES = 1_000_000; // 1 MB cap on request bodies
-
-function send(res, status, obj) {
+function send(res, status, obj, extraHeaders = {}) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+    ...extraHeaders,
   });
   res.end(body);
 }
 
-// Constant-time bearer token comparison. Returns true only on exact match.
-function tokenOk(headerValue, expected) {
-  if (typeof headerValue !== 'string') return false;
-  const m = headerValue.match(/^Bearer\s+(.+)$/i);
-  if (!m) return false;
-  const provided = Buffer.from(m[1]);
-  const want = Buffer.from(expected);
-  // timingSafeEqual throws on length mismatch; guard with a length compare that
-  // still runs a comparison to avoid trivial early-exit timing signal.
-  if (provided.length !== want.length) {
-    // Compare want against itself to burn ~equivalent time, then fail.
-    timingSafeEqual(want, want);
+function secretEqual(provided, expected) {
+  if (typeof provided !== 'string' || typeof expected !== 'string') return false;
+  const actual = Buffer.from(provided);
+  const wanted = Buffer.from(expected);
+  if (actual.length !== wanted.length) {
+    timingSafeEqual(wanted, wanted);
     return false;
   }
-  return timingSafeEqual(provided, want);
+  return timingSafeEqual(actual, wanted);
+}
+
+function apiKeyOk(req, expected) {
+  const direct = req.headers['x-api-key'];
+  if (secretEqual(direct, expected)) return true;
+  const authorization = req.headers.authorization;
+  const match = typeof authorization === 'string' ? authorization.match(/^Bearer\s+(.+)$/i) : null;
+  return Boolean(match && secretEqual(match[1], expected));
 }
 
 async function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
-    req.on('data', (c) => {
-      size += c.length;
+    req.on('data', (chunk) => {
+      size += chunk.length;
       if (size > MAX_BODY_BYTES) {
-        reject(new Error('body too large'));
+        reject(new Error('body_too_large'));
         req.destroy();
         return;
       }
-      chunks.push(c);
+      chunks.push(chunk);
     });
     req.on('end', () => {
       const raw = Buffer.concat(chunks).toString('utf8');
@@ -50,40 +52,95 @@ async function readJsonBody(req) {
       try {
         resolve(JSON.parse(raw));
       } catch {
-        reject(new Error('invalid JSON body'));
+        reject(new Error('invalid_json'));
       }
     });
     req.on('error', reject);
   });
 }
 
+function cleanInstanceId(value) {
+  const id = String(value || '').trim();
+  return /^[A-Za-z0-9_-]{1,128}$/.test(id) ? id : '';
+}
+
+function webhookUrl(value, fallback) {
+  const candidate = String(value || fallback || '').trim();
+  try {
+    const parsed = new URL(candidate);
+    return parsed.protocol === 'https:' ? parsed.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function sendBinary(res, status, body, mimeType, fileName) {
+  if (!body) return send(res, status, { ok: false, error: status === 202 ? 'not_ready' : 'not_found' });
+  res.writeHead(status, {
+    'Content-Type': mimeType,
+    'Content-Length': body.length,
+    'Cache-Control': 'private, max-age=300',
+    'X-Content-Type-Options': 'nosniff',
+    ...(fileName
+      ? { 'Content-Disposition': `inline; filename="${String(fileName).replace(/[\r\n"]/g, '')}"` }
+      : {}),
+  });
+  res.end(body);
+}
+
 export function createServer({ config, manager, logger, startTime }) {
-  const server = http.createServer(async (req, res) => {
+  return http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://localhost');
       const path = url.pathname;
       const method = req.method || 'GET';
 
-      // --- GET /health : no auth ---
       if (method === 'GET' && path === '/health') {
         return send(res, 200, {
           ok: true,
-          accounts: manager.count(),
+          status: 'healthy',
+          instances: manager.count(),
+          connected: manager.connectedCount(),
           uptime: Math.floor((Date.now() - startTime) / 1000),
         });
       }
 
-      // --- everything below requires Bearer BRIDGE_TOKEN ---
-      if (!tokenOk(req.headers['authorization'], config.bridgeToken)) {
+      if (method === 'POST' && path === '/admin/tenants') {
+        if (!config.adminApiKey || !secretEqual(req.headers['x-admin-key'], config.adminApiKey)) {
+          return send(res, 401, { ok: false, error: 'unauthorized' });
+        }
+        return send(res, 200, { apiKey: config.bridgeToken });
+      }
+
+      if (!apiKeyOk(req, config.bridgeToken)) {
         return send(res, 401, { ok: false, error: 'unauthorized' });
       }
 
-      // GET /accounts
-      if (method === 'GET' && path === '/accounts') {
+      if (method === 'GET' && (path === '/instances' || path === '/accounts')) {
         return send(res, 200, manager.list());
       }
 
-      // POST /accounts  {id,label}
+      if (method === 'POST' && path === '/instances') {
+        let body;
+        try {
+          body = await readJsonBody(req);
+        } catch (err) {
+          return send(res, 400, { ok: false, error: err.message });
+        }
+        const target = webhookUrl(body.webhookUrl, config.appWebhookUrl);
+        if (!target) return send(res, 400, { ok: false, error: 'invalid_webhook_url' });
+        const id = randomUUID();
+        const secret = randomBytes(32).toString('hex');
+        const view = await manager.create({
+          id,
+          label: String(body.name || 'WhatsApp').trim().slice(0, 80),
+          webhookUrl: target,
+          webhookSecret: secret,
+        });
+        return send(res, 201, { ...view, webhookSecret: secret });
+      }
+
+      // Backwards-compatible old bridge create endpoint.
       if (method === 'POST' && path === '/accounts') {
         let body;
         try {
@@ -91,34 +148,38 @@ export function createServer({ config, manager, logger, startTime }) {
         } catch (err) {
           return send(res, 400, { ok: false, error: err.message });
         }
-        if (!body.id || typeof body.id !== 'string') {
-          return send(res, 400, { ok: false, error: 'id (string) is required' });
-        }
-        const view = await manager.create({ id: body.id, label: body.label });
+        const id = cleanInstanceId(body.id);
+        if (!id) return send(res, 400, { ok: false, error: 'invalid_instance_id' });
+        const view = await manager.create({ id, label: body.label });
         return send(res, 200, view);
       }
 
-      // /accounts/:id and sub-resources
-      const acctMatch = path.match(/^\/accounts\/([^/]+)(?:\/(qr|send))?$/);
-      if (acctMatch) {
-        const id = decodeURIComponent(acctMatch[1]);
-        const sub = acctMatch[2];
+      const segments = path.split('/').filter(Boolean).map(decodeURIComponent);
+      if (segments[0] === 'instances' && segments[1]) {
+        const id = cleanInstanceId(segments[1]);
+        if (!id) return send(res, 400, { ok: false, error: 'invalid_instance_id' });
 
-        // DELETE /accounts/:id
-        if (method === 'DELETE' && !sub) {
-          const out = await manager.remove(id);
-          return send(res, 200, out);
-        }
-
-        // GET /accounts/:id/qr
-        if (method === 'GET' && sub === 'qr') {
+        if (method === 'GET' && segments.length === 3 && segments[2] === 'qr') {
           const out = manager.getQr(id);
-          if (out === null) return send(res, 404, { ok: false, error: 'account not found' });
-          return send(res, 200, out);
+          return out
+            ? send(res, out.qr ? 200 : 202, out)
+            : send(res, 404, { ok: false, error: 'instance_not_found' });
         }
-
-        // POST /accounts/:id/send  {to,text}
-        if (method === 'POST' && sub === 'send') {
+        if (method === 'GET' && segments.length === 3 && segments[2] === 'qr.png') {
+          const out = manager.getQrPng(id);
+          return out.body
+            ? sendBinary(res, 200, out.body, 'image/png')
+            : send(res, out.status, { ok: false, error: out.status === 202 ? 'not_ready' : 'instance_not_found' });
+        }
+        if (method === 'POST' && segments.length === 3 && segments[2] === 'logout') {
+          return send(res, 200, await manager.remove(id));
+        }
+        if (
+          method === 'POST' &&
+          segments.length === 4 &&
+          segments[2] === 'messages' &&
+          segments[3] === 'text'
+        ) {
           let body;
           try {
             body = await readJsonBody(req);
@@ -126,17 +187,54 @@ export function createServer({ config, manager, logger, startTime }) {
             return send(res, 400, { ok: false, error: err.message });
           }
           const out = await manager.send(id, { to: body.to, text: body.text });
-          if (out.ok) return send(res, 200, { ok: true, mid: out.mid });
-          return send(res, out.code || 400, { ok: false, error: out.error });
+          return out.ok
+            ? send(res, 200, { ok: true, messageId: out.messageId })
+            : send(res, out.code || 400, { ok: false, error: out.error });
+        }
+        if (
+          method === 'GET' &&
+          segments.length === 5 &&
+          segments[2] === 'messages' &&
+          segments[4] === 'media'
+        ) {
+          const media = await manager.getMedia(id, segments[3]);
+          return media
+            ? sendBinary(res, 200, media.body, media.mimeType, media.fileName)
+            : send(res, 404, { ok: false, error: 'media_not_found' });
         }
       }
 
-      return send(res, 404, { ok: false, error: 'not found' });
+      // Backwards-compatible /accounts/:id routes for any old client.
+      if (segments[0] === 'accounts' && segments[1]) {
+        const id = cleanInstanceId(segments[1]);
+        if (!id) return send(res, 400, { ok: false, error: 'invalid_instance_id' });
+        if (method === 'DELETE' && segments.length === 2) {
+          return send(res, 200, await manager.remove(id));
+        }
+        if (method === 'GET' && segments[2] === 'qr') {
+          const out = manager.getQr(id);
+          return out
+            ? send(res, 200, out)
+            : send(res, 404, { ok: false, error: 'instance_not_found' });
+        }
+        if (method === 'POST' && segments[2] === 'send') {
+          let body;
+          try {
+            body = await readJsonBody(req);
+          } catch (err) {
+            return send(res, 400, { ok: false, error: err.message });
+          }
+          const out = await manager.send(id, { to: body.to, text: body.text });
+          return out.ok
+            ? send(res, 200, { ok: true, mid: out.messageId })
+            : send(res, out.code || 400, { ok: false, error: out.error });
+        }
+      }
+
+      return send(res, 404, { ok: false, error: 'not_found' });
     } catch (err) {
       logger.error({ err: err.message }, 'unhandled request error');
-      return send(res, 500, { ok: false, error: 'internal error' });
+      return send(res, 500, { ok: false, error: 'internal_error' });
     }
   });
-
-  return server;
 }

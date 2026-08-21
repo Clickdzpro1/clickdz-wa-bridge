@@ -1,10 +1,10 @@
 import { createHmac } from 'node:crypto';
 
-// Dispatches signed events to the app webhook (APP_WEBHOOK_URL).
+// Dispatches signed per-instance envelopes to the app webhook.
 //
 // Signature scheme (MUST match the app-side /api/whatsapp/bridge verifier):
-//   header  X-Bridge-Signature-256: sha256=<hex>
-//   hex   = HMAC_SHA256(key = BRIDGE_WEBHOOK_SECRET, msg = rawBody)
+//   headers X-WA-Event, X-WA-Instance, X-WA-Signature
+//   signature = hex(HMAC_SHA256(instance webhookSecret, rawBody))
 //   rawBody is the exact JSON string that is sent as the request body.
 //
 // Retries with exponential backoff on non-2xx / network error, then drops with
@@ -13,15 +13,24 @@ import { createHmac } from 'node:crypto';
 const BACKOFF_MS = [1000, 2000, 4000, 8000, 30000]; // attempts = length + 1
 
 function sign(secret, rawBody) {
-  const hex = createHmac('sha256', secret).update(rawBody).digest('hex');
-  return `sha256=${hex}`;
+  return createHmac('sha256', secret).update(rawBody).digest('hex');
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export function makeWebhookDispatcher({ url, secret, logger }) {
-  async function post(event) {
-    const rawBody = JSON.stringify(event);
+export function makeWebhookDispatcher({ logger }) {
+  async function post({ url, secret, event, instanceId, data }) {
+    if (!url || !secret || !instanceId) {
+      logger.error({ event, instanceId }, 'webhook target is incomplete');
+      return false;
+    }
+    const envelope = {
+      event,
+      instanceId,
+      timestamp: new Date().toISOString(),
+      data,
+    };
+    const rawBody = JSON.stringify(envelope);
     const signature = sign(secret, rawBody);
     const maxAttempts = BACKOFF_MS.length + 1;
 
@@ -35,7 +44,9 @@ export function makeWebhookDispatcher({ url, secret, logger }) {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
-              'X-Bridge-Signature-256': signature,
+              'X-WA-Event': event,
+              'X-WA-Instance': instanceId,
+              'X-WA-Signature': signature,
             },
             body: rawBody,
             signal: controller.signal,
@@ -45,17 +56,17 @@ export function makeWebhookDispatcher({ url, secret, logger }) {
         }
 
         if (res.ok) {
-          logger.debug({ type: event.type, accountId: event.accountId }, 'webhook delivered');
+          logger.debug({ event, instanceId }, 'webhook delivered');
           return true;
         }
         // Non-2xx: retry (app dedups by mid, so retries are safe).
         logger.warn(
-          { type: event.type, accountId: event.accountId, status: res.status, attempt },
+          { event, instanceId, status: res.status, attempt },
           'webhook non-2xx, will retry'
         );
       } catch (err) {
         logger.warn(
-          { type: event.type, accountId: event.accountId, err: err.message, attempt },
+          { event, instanceId, err: err.message, attempt },
           'webhook error, will retry'
         );
       }
@@ -64,7 +75,7 @@ export function makeWebhookDispatcher({ url, secret, logger }) {
     }
 
     logger.error(
-      { type: event.type, accountId: event.accountId },
+      { event, instanceId },
       'webhook permanently failed after retries, dropping event'
     );
     return false;

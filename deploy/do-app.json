@@ -27,6 +27,9 @@
           { "key": "KV_REST_API_TOKEN", "value": "<FILL:SECRET>", "type": "SECRET", "scope": "RUN_TIME" },
           { "key": "AUTH_STORE", "value": "redis", "type": "GENERAL", "scope": "RUN_TIME" },
           { "key": "AUTH_STATE_PREFIX", "value": "wa:bridge:auth", "type": "GENERAL", "scope": "RUN_TIME" },
+          { "key": "MEDIA_DIR", "value": "/tmp/wa-bridge-media", "type": "GENERAL", "scope": "RUN_TIME" },
+          { "key": "MAX_MEDIA_BYTES", "value": "10485760", "type": "GENERAL", "scope": "RUN_TIME" },
+          { "key": "MEDIA_RETENTION_DAYS", "value": "30", "type": "GENERAL", "scope": "RUN_TIME" },
           { "key": "LOG_LEVEL", "value": "info", "type": "GENERAL", "scope": "RUN_TIME" }
         ]
       }

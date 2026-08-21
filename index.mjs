@@ -3,6 +3,7 @@ import { makeLogger } from './src/logger.mjs';
 import { makeRedis } from './src/redis.mjs';
 import { makeWebhookDispatcher } from './src/webhook.mjs';
 import { makeManager } from './src/manager.mjs';
+import { makeRegistry } from './src/registry.mjs';
 import { createServer } from './src/server.mjs';
 
 // --- Fail fast on bad/missing config ---
@@ -29,13 +30,20 @@ const redis =
     ? makeRedis({ url: config.kvRestUrl, token: config.kvRestToken })
     : null;
 
-const dispatcher = makeWebhookDispatcher({
-  url: config.appWebhookUrl,
-  secret: config.bridgeWebhookSecret,
-  logger,
-});
+const dispatcher = makeWebhookDispatcher({ logger });
 
-const manager = makeManager({ config, redis, logger, dispatcher });
+const registry = makeRegistry({ config, redis, logger });
+const manager = makeManager({ config, redis, registry, logger, dispatcher });
+
+// Restore and boot every previously-created instance before accepting traffic.
+// A registry failure is fatal: serving an empty healthy process would silently
+// strand paired numbers until an operator recreated them.
+try {
+  await manager.restore();
+} catch (err) {
+  logger.fatal({ err: err.message }, 'instance registry restore failed');
+  process.exit(1);
+}
 
 const server = createServer({ config, manager, logger, startTime });
 

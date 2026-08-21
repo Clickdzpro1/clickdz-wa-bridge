@@ -1,40 +1,20 @@
 import makeWASocket, {
-  DisconnectReason,
-  makeCacheableSignalKeyStore,
-  getContentType,
   Browsers,
+  DisconnectReason,
+  downloadMediaMessage,
   fetchLatestBaileysVersion,
+  getContentType,
   jidNormalizedUser,
+  makeCacheableSignalKeyStore,
 } from '@whiskeysockets/baileys';
+import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import QRCode from 'qrcode';
 import { makeAuthState } from './authState.mjs';
 
-// Multi-account Baileys manager.
-//   sessions: Map<accountId, session>
-//   session = { id, label, status, phone, qrDataUrl, sock, auth, ...internals }
-//
-// status ∈ 'pairing' | 'connected' | 'disconnected' | 'logged_out'
-
-const MAX_BACKOFF_MS = 60000;
-const BASE_BACKOFF_MS = 2000;
+const MAX_BACKOFF_MS = 60_000;
+const BASE_BACKOFF_MS = 2_000;
 const S_WHATSAPP_NET = '@s.whatsapp.net';
-
-// Placeholder text for non-text messages, matching the Cloud webhook convention.
-const MEDIA_PLACEHOLDER = {
-  imageMessage: '[image]',
-  videoMessage: '[video]',
-  audioMessage: '[audio]',
-  documentMessage: '[document]',
-  documentWithCaptionMessage: '[document]',
-  stickerMessage: '[sticker]',
-  contactMessage: '[contact]',
-  contactsArrayMessage: '[contacts]',
-  locationMessage: '[location]',
-  liveLocationMessage: '[location]',
-  pollCreationMessage: '[poll]',
-  pollCreationMessageV3: '[poll]',
-  reactionMessage: '[reaction]',
-};
 
 function digitsFromJid(jid) {
   if (!jid) return '';
@@ -42,78 +22,166 @@ function digitsFromJid(jid) {
 }
 
 function jidFromDigits(to) {
-  const digits = String(to).replace(/[^0-9]/g, '');
-  return `${digits}${S_WHATSAPP_NET}`;
+  return `${String(to).replace(/[^0-9]/g, '')}${S_WHATSAPP_NET}`;
 }
 
-// Extract displayable text from a WhatsApp message content object.
-// Returns null if the message carries no user-facing content we relay.
-function extractText(message) {
-  if (!message) return null;
+function safeSegment(value) {
+  return String(value || '').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 256);
+}
+
+function unwrapMessage(message) {
   let content = message;
-  // Unwrap common envelopes.
-  if (content.ephemeralMessage?.message) content = content.ephemeralMessage.message;
-  if (content.viewOnceMessage?.message) content = content.viewOnceMessage.message;
-  if (content.viewOnceMessageV2?.message) content = content.viewOnceMessageV2.message;
-  if (content.documentWithCaptionMessage?.message)
-    content = content.documentWithCaptionMessage.message;
-
-  const type = getContentType(content);
-  if (!type) return null;
-
-  if (type === 'conversation') return content.conversation || '';
-  if (type === 'extendedTextMessage') return content.extendedTextMessage?.text || '';
-  // Media with caption → prefer caption, else the type placeholder.
-  const cap =
-    content.imageMessage?.caption ||
-    content.videoMessage?.caption ||
-    content.documentMessage?.caption;
-  if (cap) return cap;
-  return MEDIA_PLACEHOLDER[type] || `[${type.replace(/Message$/, '').toLowerCase()}]`;
+  for (let i = 0; i < 4 && content; i += 1) {
+    if (content.ephemeralMessage?.message) content = content.ephemeralMessage.message;
+    else if (content.viewOnceMessage?.message) content = content.viewOnceMessage.message;
+    else if (content.viewOnceMessageV2?.message) content = content.viewOnceMessageV2.message;
+    else if (content.documentWithCaptionMessage?.message)
+      content = content.documentWithCaptionMessage.message;
+    else break;
+  }
+  return content;
 }
 
-export function makeManager({ config, redis, logger, dispatcher }) {
-  const sessions = new Map();
+function extractContent(message) {
+  const content = unwrapMessage(message);
+  const type = getContentType(content);
+  if (!type) return { text: '', media: null };
+  if (type === 'conversation') return { text: content.conversation || '', media: null };
+  if (type === 'extendedTextMessage') {
+    return { text: content.extendedTextMessage?.text || '', media: null };
+  }
+  const mapping = {
+    imageMessage: ['image', content.imageMessage],
+    videoMessage: ['video', content.videoMessage],
+    audioMessage: ['audio', content.audioMessage],
+    documentMessage: ['document', content.documentMessage],
+    stickerMessage: ['sticker', content.stickerMessage],
+  };
+  const mapped = mapping[type];
+  if (!mapped) return { text: '', media: null };
+  const [kind, node] = mapped;
+  const caption = node?.caption || '';
+  return {
+    text: caption,
+    media: {
+      type: kind,
+      mimeType: node?.mimetype || undefined,
+      fileName: node?.fileName || undefined,
+      caption: caption || undefined,
+      voice: kind === 'audio' ? Boolean(node?.ptt) : undefined,
+    },
+  };
+}
 
-  function publicView(s) {
+export function makeManager({ config, redis, registry, logger, dispatcher }) {
+  const sessions = new Map();
+  let cleanupTimer = null;
+
+  function publicView(session) {
     return {
-      id: s.id,
-      label: s.label,
-      status: s.status,
-      ...(s.phone ? { phone: s.phone } : {}),
-      ...(s.connectedAt ? { connectedAt: s.connectedAt } : {}),
+      id: session.id,
+      label: session.label,
+      status: session.status,
+      connected: session.status === 'connected',
+      ...(session.phone ? { phone: session.phone } : {}),
+      ...(session.connectedAt ? { connectedAt: session.connectedAt } : {}),
     };
   }
 
-  function emitStatus(s) {
+  const registryView = (session) => ({
+    id: session.id,
+    label: session.label,
+    webhookUrl: session.webhookUrl,
+    webhookSecret: session.webhookSecret,
+  });
+
+  async function persistRegistry() {
+    await registry.save([...sessions.values()].filter((s) => !s.deleted).map(registryView));
+  }
+
+  function emit(session, event, data) {
     dispatcher.dispatch({
-      type: 'account.status',
-      accountId: s.id,
-      status: s.status,
-      ...(s.phone ? { phone: s.phone } : {}),
+      url: session.webhookUrl,
+      secret: session.webhookSecret,
+      event,
+      instanceId: session.id,
+      data,
     });
   }
 
-  function setStatus(s, status, { emit = true } = {}) {
-    if (s.status === status) return;
-    s.status = status;
-    logger.info({ accountId: s.id, status }, 'account status change');
-    if (emit) emitStatus(s);
+  function setStatus(session, status) {
+    if (session.status === status) return false;
+    session.status = status;
+    logger.info({ instanceId: session.id, status }, 'instance status change');
+    return true;
   }
 
-  // Boot (or reboot) the Baileys socket for a session.
-  async function startSocket(s) {
-    // Build/refresh auth state (creds survive restarts via redis/disk).
-    const auth = await makeAuthState({ config, redis, accountId: s.id, logger });
-    s.auth = auth;
+  async function persistMedia(instanceId, messageId, bytes, metadata) {
+    if (!messageId || !Buffer.isBuffer(bytes) || bytes.length === 0) return false;
+    if (bytes.length > config.maxMediaBytes) {
+      logger.warn({ instanceId, messageId, bytes: bytes.length }, 'media exceeds storage limit');
+      return false;
+    }
+    const dir = join(config.mediaDir, safeSegment(instanceId));
+    const stem = safeSegment(messageId);
+    await mkdir(dir, { recursive: true });
+    await Promise.all([
+      writeFile(join(dir, `${stem}.bin`), bytes, { mode: 0o600 }),
+      writeFile(join(dir, `${stem}.json`), JSON.stringify(metadata), { mode: 0o600 }),
+    ]);
+    return true;
+  }
 
+  async function cleanupExpiredMedia() {
+    const cutoff = Date.now() - config.mediaRetentionDays * 24 * 60 * 60 * 1000;
+    const instanceDirs = await readdir(config.mediaDir, { withFileTypes: true }).catch((err) => {
+      if (err.code === 'ENOENT') return [];
+      throw err;
+    });
+    for (const instanceDir of instanceDirs) {
+      if (!instanceDir.isDirectory()) continue;
+      const dir = join(config.mediaDir, instanceDir.name);
+      const files = await readdir(dir).catch(() => []);
+      for (const file of files) {
+        const path = join(dir, file);
+        const info = await stat(path).catch(() => null);
+        if (info && info.mtimeMs < cutoff) await rm(path, { force: true });
+      }
+    }
+  }
+
+  async function getMedia(instanceId, messageId) {
+    if (!sessions.has(instanceId)) return null;
+    const dir = join(config.mediaDir, safeSegment(instanceId));
+    const stem = safeSegment(messageId);
+    try {
+      const [body, rawMetadata] = await Promise.all([
+        readFile(join(dir, `${stem}.bin`)),
+        readFile(join(dir, `${stem}.json`), 'utf8'),
+      ]);
+      const metadata = JSON.parse(rawMetadata);
+      return {
+        body,
+        mimeType: metadata.mimeType || 'application/octet-stream',
+        fileName: metadata.fileName,
+      };
+    } catch (err) {
+      if (err.code !== 'ENOENT') {
+        logger.warn({ instanceId, messageId, err: err.message }, 'media read failed');
+      }
+      return null;
+    }
+  }
+
+  async function startSocket(session) {
+    const auth = await makeAuthState({ config, redis, accountId: session.id, logger });
+    session.auth = auth;
     let version;
     try {
       ({ version } = await fetchLatestBaileysVersion());
     } catch {
-      version = undefined; // Baileys falls back to its bundled version.
+      version = undefined;
     }
-
     const sock = makeWASocket({
       auth: {
         creds: auth.state.creds,
@@ -122,173 +190,181 @@ export function makeManager({ config, redis, logger, dispatcher }) {
       version,
       logger,
       browser: Browsers.macOS('Chrome'),
-      // Keep the owner's phone receiving its own notifications.
       markOnlineOnConnect: false,
-      keepAliveIntervalMs: 30000,
-      // Do not pull full history; we only relay live inbound.
+      keepAliveIntervalMs: 30_000,
       syncFullHistory: false,
-      // Poll/retry decrypt hook — we do not cache outgoing content for resend.
       getMessage: async () => undefined,
     });
-    s.sock = sock;
-
+    session.sock = sock;
     sock.ev.on('creds.update', () => {
       auth.saveCreds().catch((err) =>
-        logger.error({ accountId: s.id, err: err.message }, 'saveCreds failed')
+        logger.error({ instanceId: session.id, err: err.message }, 'saveCreds failed')
       );
     });
-
     sock.ev.on('connection.update', (update) => {
-      handleConnectionUpdate(s, update).catch((err) =>
-        logger.error({ accountId: s.id, err: err.message }, 'connection.update handler crashed')
+      handleConnectionUpdate(session, update).catch((err) =>
+        logger.error({ instanceId: session.id, err: err.message }, 'connection handler crashed')
       );
     });
-
-    sock.ev.on('messages.upsert', (evt) => {
-      handleMessagesUpsert(s, evt).catch((err) =>
-        logger.error({ accountId: s.id, err: err.message }, 'messages.upsert handler crashed')
+    sock.ev.on('messages.upsert', (event) => {
+      handleMessagesUpsert(session, event).catch((err) =>
+        logger.error({ instanceId: session.id, err: err.message }, 'message handler crashed')
       );
     });
   }
 
-  async function handleConnectionUpdate(s, update) {
+  async function handleConnectionUpdate(session, update) {
     const { connection, lastDisconnect, qr } = update;
-
     if (qr) {
-      // Render QR to a data URL for the /qr endpoint.
+      session.qrRaw = qr;
       try {
-        s.qrDataUrl = await QRCode.toDataURL(qr);
+        session.qrPng = await QRCode.toBuffer(qr, { type: 'png', margin: 2, width: 512 });
       } catch (err) {
-        logger.warn({ accountId: s.id, err: err.message }, 'QR render failed');
+        session.qrPng = null;
+        logger.warn({ instanceId: session.id, err: err.message }, 'QR render failed');
       }
-      setStatus(s, 'pairing');
+      setStatus(session, 'pairing');
+      emit(session, 'qr', { qr });
     }
-
     if (connection === 'open') {
-      s.qrDataUrl = null;
-      s.reconnectAttempts = 0;
-      s.connectedAt = new Date().toISOString();
-      const meId = s.sock?.user?.id || s.auth?.state?.creds?.me?.id;
-      s.phone = digitsFromJid(meId);
-      setStatus(s, 'connected');
+      session.qrRaw = null;
+      session.qrPng = null;
+      session.reconnectAttempts = 0;
+      session.connectedAt = new Date().toISOString();
+      const meId = session.sock?.user?.id || session.auth?.state?.creds?.me?.id;
+      session.phone = digitsFromJid(meId);
+      setStatus(session, 'connected');
+      emit(session, 'instance.ready', {
+        phoneNumber: session.phone ? `+${session.phone}` : null,
+      });
     }
-
     if (connection === 'close') {
       const statusCode =
         lastDisconnect?.error?.output?.statusCode ??
         lastDisconnect?.error?.output?.payload?.statusCode;
-      logger.info({ accountId: s.id, statusCode }, 'connection closed');
-
-      // If the account was explicitly deleted, stop here.
-      if (s.deleted) return;
-
+      logger.info({ instanceId: session.id, statusCode }, 'connection closed');
+      if (session.deleted) return;
       if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.forbidden) {
-        // 401 loggedOut / 403 forbidden → wipe state, require re-pair. Do NOT reconnect.
-        s.qrDataUrl = null;
-        s.phone = undefined;
-        s.connectedAt = undefined;
+        session.qrRaw = null;
+        session.qrPng = null;
+        session.phone = undefined;
+        session.connectedAt = undefined;
         try {
-          await s.auth?.wipe();
+          await session.auth?.wipe();
         } catch (err) {
-          logger.warn({ accountId: s.id, err: err.message }, 'auth wipe failed on logout');
+          logger.warn({ instanceId: session.id, err: err.message }, 'auth wipe failed on logout');
         }
-        setStatus(s, 'logged_out');
+        setStatus(session, 'logged_out');
+        emit(session, 'instance.logged_out', {});
         return;
       }
-
-      // Transient / restart-required codes → reconnect with backoff, reusing state.
-      // 515 restartRequired, 428 connectionClosed, 408 timedOut, 440 connectionReplaced,
-      // 500 badSession, 503 unavailableService, plus any unknown code default-to-retry.
-      setStatus(s, 'disconnected');
-      scheduleReconnect(s);
+      setStatus(session, 'disconnected');
+      emit(session, 'connection.update', {
+        connection: 'disconnected',
+        reason: String(statusCode || 'unknown'),
+      });
+      scheduleReconnect(session);
     }
   }
 
-  function scheduleReconnect(s) {
-    if (s.deleted) return;
-    if (s.reconnectTimer) return; // already scheduled
-    s.reconnectAttempts = (s.reconnectAttempts || 0) + 1;
-    const jitter = Math.floor(Math.random() * 1000);
-    const delay = Math.min(BASE_BACKOFF_MS * 2 ** (s.reconnectAttempts - 1), MAX_BACKOFF_MS) + jitter;
-    logger.info({ accountId: s.id, attempt: s.reconnectAttempts, delay }, 'scheduling reconnect');
-    s.reconnectTimer = setTimeout(() => {
-      s.reconnectTimer = null;
-      if (s.deleted) return;
-      startSocket(s).catch((err) => {
-        logger.error({ accountId: s.id, err: err.message }, 'reconnect failed, rescheduling');
-        scheduleReconnect(s);
+  function scheduleReconnect(session) {
+    if (session.deleted || session.reconnectTimer) return;
+    session.reconnectAttempts = (session.reconnectAttempts || 0) + 1;
+    const jitter = Math.floor(Math.random() * 1_000);
+    const delay =
+      Math.min(BASE_BACKOFF_MS * 2 ** (session.reconnectAttempts - 1), MAX_BACKOFF_MS) + jitter;
+    logger.info(
+      { instanceId: session.id, attempt: session.reconnectAttempts, delay },
+      'scheduling reconnect'
+    );
+    session.reconnectTimer = setTimeout(() => {
+      session.reconnectTimer = null;
+      if (session.deleted) return;
+      startSocket(session).catch((err) => {
+        logger.error({ instanceId: session.id, err: err.message }, 'reconnect failed');
+        scheduleReconnect(session);
       });
     }, delay);
   }
 
-  async function handleMessagesUpsert(s, evt) {
-    // Only live notifications; ignore history 'append'.
-    if (evt.type !== 'notify') return;
-    for (const msg of evt.messages || []) {
+  async function handleMessagesUpsert(session, event) {
+    if (event.type !== 'notify') return;
+    for (const msg of event.messages || []) {
       try {
         if (!msg.message) continue;
-        if (msg.key?.fromMe) continue; // never mirror our own sends
         const remoteJid = msg.key?.remoteJid || '';
-        // Skip groups/status/broadcast — v1 relays 1:1 user chats only.
         if (!remoteJid.endsWith(S_WHATSAPP_NET)) continue;
-
-        const text = extractText(msg.message);
-        if (text === null) continue;
-
-        const from = digitsFromJid(remoteJid);
-        const mid = msg.key?.id;
-        const tsSeconds =
+        const { text, media } = extractContent(msg.message);
+        if (!text && !media) continue;
+        const messageId = msg.key?.id || '';
+        if (media && messageId) {
+          try {
+            const bytes = await downloadMediaMessage(
+              msg,
+              'buffer',
+              {},
+              { logger, reuploadRequest: session.sock?.updateMediaMessage }
+            );
+            await persistMedia(session.id, messageId, bytes, media);
+          } catch (err) {
+            logger.warn(
+              { instanceId: session.id, messageId, err: err.message },
+              'media download failed; metadata will still be relayed'
+            );
+          }
+        }
+        const timestampSeconds =
           typeof msg.messageTimestamp === 'number'
             ? msg.messageTimestamp
             : Number(msg.messageTimestamp?.low ?? msg.messageTimestamp) || Math.floor(Date.now() / 1000);
-        const timestamp = new Date(tsSeconds * 1000).toISOString();
-
-        dispatcher.dispatch({
-          type: 'message.in',
-          accountId: s.id,
-          mid,
-          from,
-          ...(msg.pushName ? { name: msg.pushName } : {}),
+        const data = {
+          id: messageId,
+          chatJid: remoteJid,
+          chatPhone: digitsFromJid(remoteJid),
+          sender: msg.key?.participant || remoteJid,
+          senderPhone: digitsFromJid(msg.key?.participant || remoteJid),
+          pushName: msg.pushName || null,
           text,
-          timestamp,
-        });
-        // Redacted log — never the body or number at info level.
-        logger.debug({ accountId: s.id, mid }, 'inbound relayed');
+          timestamp: new Date(timestampSeconds * 1000).toISOString(),
+          isGroup: false,
+          hasMedia: Boolean(media),
+          fromMe: Boolean(msg.key?.fromMe),
+          ...(media ? { media } : {}),
+        };
+        emit(session, msg.key?.fromMe ? 'message.sent' : 'message', data);
+        logger.debug({ instanceId: session.id, messageId }, 'message relayed');
       } catch (err) {
-        logger.error({ accountId: s.id, err: err.message }, 'failed handling inbound message');
+        logger.error({ instanceId: session.id, err: err.message }, 'failed handling message');
       }
     }
   }
 
-  // ---- public API used by the HTTP layer ----
+  const list = () => [...sessions.values()].map(publicView);
+  const get = (id) => (sessions.has(id) ? publicView(sessions.get(id)) : null);
+  const count = () => sessions.size;
+  const connectedCount = () =>
+    [...sessions.values()].filter((session) => session.status === 'connected').length;
 
-  function list() {
-    return [...sessions.values()].map(publicView);
-  }
-
-  function get(id) {
-    const s = sessions.get(id);
-    return s ? publicView(s) : null;
-  }
-
-  function count() {
-    return sessions.size;
-  }
-
-  // Idempotent: creating an existing id returns the current view without reboot.
-  async function create({ id, label }) {
+  async function create({ id, label, webhookUrl, webhookSecret }, options = {}) {
     if (!id || typeof id !== 'string') throw new Error('id is required');
     const existing = sessions.get(id);
     if (existing) {
-      if (label && label !== existing.label) existing.label = label;
+      if (label) existing.label = String(label).slice(0, 80);
+      if (webhookUrl) existing.webhookUrl = webhookUrl;
+      if (webhookSecret) existing.webhookSecret = webhookSecret;
+      if (options.persist !== false) await persistRegistry();
       return publicView(existing);
     }
-    const s = {
+    const session = {
       id,
-      label: label || id,
+      label: String(label || id).slice(0, 80),
+      webhookUrl: webhookUrl || config.appWebhookUrl,
+      webhookSecret: webhookSecret || config.bridgeWebhookSecret,
       status: 'pairing',
       phone: undefined,
-      qrDataUrl: null,
+      connectedAt: undefined,
+      qrRaw: null,
+      qrPng: null,
       sock: null,
       auth: null,
       reconnectAttempts: 0,
@@ -296,98 +372,139 @@ export function makeManager({ config, redis, logger, dispatcher }) {
       deleted: false,
       lastSendAt: 0,
     };
-    sessions.set(id, s);
-    logger.info({ accountId: id }, 'account created, booting socket');
-    // Boot asynchronously; QR will appear via /qr shortly.
-    startSocket(s).catch((err) => {
-      logger.error({ accountId: id, err: err.message }, 'initial socket boot failed');
-      setStatus(s, 'disconnected');
-      scheduleReconnect(s);
+    sessions.set(id, session);
+    if (options.persist !== false) await persistRegistry();
+    logger.info({ instanceId: id }, 'instance created, booting socket');
+    startSocket(session).catch((err) => {
+      logger.error({ instanceId: id, err: err.message }, 'initial socket boot failed');
+      setStatus(session, 'disconnected');
+      emit(session, 'connection.update', { connection: 'disconnected', reason: 'boot_failed' });
+      scheduleReconnect(session);
     });
-    return publicView(s);
+    return publicView(session);
+  }
+
+  async function restore() {
+    await cleanupExpiredMedia().catch((err) =>
+      logger.warn({ err: err.message }, 'media retention cleanup failed')
+    );
+    cleanupTimer = setInterval(() => {
+      cleanupExpiredMedia().catch((err) =>
+        logger.warn({ err: err.message }, 'media retention cleanup failed')
+      );
+    }, 6 * 60 * 60 * 1000);
+    cleanupTimer.unref();
+    const stored = await registry.load();
+    for (const item of stored) {
+      await create(
+        {
+          id: item.id,
+          label: item.label,
+          webhookUrl: item.webhookUrl || config.appWebhookUrl,
+          webhookSecret: item.webhookSecret || config.bridgeWebhookSecret,
+        },
+        { persist: false }
+      );
+    }
+    logger.info({ instances: stored.length }, 'instance registry restored');
   }
 
   async function remove(id) {
-    const s = sessions.get(id);
-    if (!s) return { ok: true };
-    s.deleted = true;
-    if (s.reconnectTimer) {
-      clearTimeout(s.reconnectTimer);
-      s.reconnectTimer = null;
-    }
-    // Logout (best-effort) then forget auth state.
+    const session = sessions.get(id);
+    if (!session) return { ok: true };
+    session.deleted = true;
+    if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
     try {
-      await s.sock?.logout();
+      await session.sock?.logout();
     } catch (err) {
-      logger.warn({ accountId: id, err: err.message }, 'logout failed during delete (continuing)');
+      logger.warn({ instanceId: id, err: err.message }, 'logout failed during delete');
     }
     try {
-      s.sock?.end?.(undefined);
+      session.sock?.end?.(undefined);
     } catch {
-      /* ignore */
+      // ignored
     }
     try {
-      await s.auth?.wipe();
+      await session.auth?.wipe();
     } catch (err) {
-      logger.warn({ accountId: id, err: err.message }, 'auth wipe failed during delete');
+      logger.warn({ instanceId: id, err: err.message }, 'auth wipe failed during delete');
     }
+    emit(session, 'instance.logged_out', {});
     sessions.delete(id);
-    logger.info({ accountId: id }, 'account deleted and auth state forgotten');
-    // Best-effort final status to the app.
-    dispatcher.dispatch({ type: 'account.status', accountId: id, status: 'logged_out' });
+    await persistRegistry();
+    logger.info({ instanceId: id }, 'instance deleted and auth state forgotten');
     return { ok: true };
   }
 
   function getQr(id) {
-    const s = sessions.get(id);
-    if (!s) return null; // caller maps to 404
-    const qr = s.status === 'pairing' ? s.qrDataUrl || null : null;
-    return { qr, status: s.status };
+    const session = sessions.get(id);
+    if (!session) return null;
+    return {
+      qr: session.status === 'pairing' ? session.qrRaw : null,
+      status: session.status,
+      connected: session.status === 'connected',
+    };
+  }
+
+  function getQrPng(id) {
+    const session = sessions.get(id);
+    if (!session) return { status: 404, body: null };
+    if (session.status !== 'pairing' || !session.qrPng) return { status: 202, body: null };
+    return { status: 200, body: session.qrPng };
   }
 
   async function send(id, { to, text }) {
-    const s = sessions.get(id);
-    if (!s) return { ok: false, error: 'account not found', code: 404 };
-    if (s.status !== 'connected' || !s.sock) {
-      return { ok: false, error: `account not connected (status=${s.status})`, code: 409 };
+    const session = sessions.get(id);
+    if (!session) return { ok: false, error: 'instance_not_found', code: 404 };
+    if (session.status !== 'connected' || !session.sock) {
+      return { ok: false, error: 'instance_not_connected', code: 409 };
     }
     if (!to || !String(to).replace(/[^0-9]/g, '')) {
-      return { ok: false, error: 'invalid "to"', code: 400 };
+      return { ok: false, error: 'invalid_recipient', code: 400 };
     }
-    if (typeof text !== 'string' || !text.length) {
-      return { ok: false, error: 'invalid "text"', code: 400 };
+    if (typeof text !== 'string' || !text.trim()) {
+      return { ok: false, error: 'text_required', code: 400 };
     }
-
-    // Optional per-account anti-ban pacing.
     if (config.sendThrottleMs > 0) {
-      const wait = s.lastSendAt + config.sendThrottleMs - Date.now();
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      const wait = session.lastSendAt + config.sendThrottleMs - Date.now();
+      if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
     }
-
     try {
       const jid = jidNormalizedUser(jidFromDigits(to));
-      const sent = await s.sock.sendMessage(jid, { text });
-      s.lastSendAt = Date.now();
-      const mid = sent?.key?.id;
-      logger.debug({ accountId: id, mid }, 'outbound sent');
-      return { ok: true, mid };
+      const sent = await session.sock.sendMessage(jid, { text: text.slice(0, 4000) });
+      session.lastSendAt = Date.now();
+      return { ok: true, messageId: sent?.key?.id };
     } catch (err) {
-      logger.error({ accountId: id, err: err.message }, 'send failed');
-      return { ok: false, error: err.message || 'send failed', code: 502 };
+      logger.error({ instanceId: id, err: err.message }, 'send failed');
+      return { ok: false, error: 'send_failed', code: 502 };
     }
   }
 
   async function shutdown() {
-    for (const s of sessions.values()) {
-      s.deleted = true;
-      if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
+    if (cleanupTimer) clearInterval(cleanupTimer);
+    for (const session of sessions.values()) {
+      session.deleted = true;
+      if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
       try {
-        s.sock?.end?.(undefined);
+        session.sock?.end?.(undefined);
       } catch {
-        /* ignore */
+        // ignored
       }
     }
   }
 
-  return { list, get, count, create, remove, getQr, send, shutdown };
+  return {
+    list,
+    get,
+    count,
+    connectedCount,
+    create,
+    restore,
+    remove,
+    getQr,
+    getQrPng,
+    getMedia,
+    send,
+    shutdown,
+  };
 }

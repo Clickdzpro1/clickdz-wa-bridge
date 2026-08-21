@@ -33,8 +33,11 @@ async function makeRedisAuthState({ redis, prefix, accountId, logger }) {
     const raw = await redis.get(credsKey);
     creds = raw ? JSON.parse(raw, BufferJSON.reviver) : initAuthCreds();
   } catch (err) {
-    logger?.warn({ accountId, err: err.message }, 'failed reading creds, starting fresh');
-    creds = initAuthCreds();
+    /* Fail closed: treating a transient Redis outage as "no credentials" would
+     * boot a fresh session and force a new QR, effectively logging out a valid
+     * paired number. The manager's reconnect loop will retry with backoff. */
+    logger?.error({ accountId, err: err.message }, 'failed reading creds; refusing fresh session');
+    throw err;
   }
 
   const keys = {

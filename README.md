@@ -2,7 +2,7 @@
 
 Multi-account WhatsApp **QR-paired** (WhatsApp-Web-style) bridge for the ClickDZ
 copilot. It runs a [Baileys](https://github.com/WhiskeySockets/Baileys) v7 socket
-per linked number, exposes a small Bearer-authenticated HTTP admin API, and pushes
+per linked number, exposes a small API-key-authenticated HTTP API, and pushes
 inbound messages + lifecycle events to the app over an HMAC-signed webhook. Auth
 state is persisted in **Redis (Upstash REST)** so sessions survive restarts and
 redeploys on platforms with no disk.
@@ -27,12 +27,15 @@ The Meta **Cloud API** channel stays as-is; QR accounts are additive.
 - **Runtime:** Node 22+, ESM. **Deps (minimal):** `@whiskeysockets/baileys` (v7),
   `qrcode`, `pino`. HTTP is bare `node:http` (no framework). Redis is spoken over
   Upstash REST with `fetch` — no DB client.
-- **Auth state:** custom `SignalKeyStore` + creds persistence over Upstash REST,
-  namespaced per `accountId`, serialized with Baileys' `BufferJSON`. Disk fallback
-  (`useMultiFileAuthState`) for local dev via `AUTH_STORE=disk`.
-- **Inbound:** `messages.upsert` (notify, non-fromMe, 1:1 text/caption) → signed
-  POST to the app. **Outbound (app→WhatsApp):** direct authenticated POST to
-  `/accounts/:id/send`.
+- **Auth state + roster:** custom `SignalKeyStore` plus a durable instance
+  registry over Upstash REST, or disk-backed state on a Droplet. Every persisted
+  instance is automatically rebooted after a restart; paired numbers do not
+  silently disappear from the process roster.
+- **Inbound:** `messages.upsert` (1:1 text and rich media) → a per-instance HMAC
+  signed POST to the app. Media bytes are retained under `MEDIA_DIR` and fetched
+  through the authenticated media endpoint; tokens never reach the browser.
+- **Outbound (app→WhatsApp):** `POST /instances/:id/messages/text` with
+  `x-api-key: $BRIDGE_TOKEN`.
 - **Single-instance invariant:** exactly one process; Baileys holds one live
   WebSocket per account. **Never scale out** (duplicate sockets → double sends /
   ban risk). Scale up instead.
@@ -43,41 +46,42 @@ The Meta **Cloud API** channel stays as-is; QR accounts are additive.
 
 `GET /health` — **no auth.** `{ ok: true, accounts: <n>, uptime: <seconds> }`.
 
-All other endpoints require `Authorization: Bearer $BRIDGE_TOKEN`
-(constant-time compare; `401` otherwise):
+All other endpoints require `x-api-key: $BRIDGE_TOKEN` (the legacy
+`Authorization: Bearer` form is also accepted; both use constant-time compare):
 
 | Method & path | Body | Returns |
 |---|---|---|
-| `GET /accounts` | — | `[{id,label,status,phone?,connectedAt?}]` |
-| `POST /accounts` | `{id,label}` | `{id,label,status:"pairing"}` (idempotent on `id`; boots a socket) |
-| `DELETE /accounts/:id` | — | `{ok:true}` (logout + forget auth state) |
-| `GET /accounts/:id/qr` | — | `{qr:<dataUrl>\|null, status}` (`qr` non-null only while `status==="pairing"`) |
-| `POST /accounts/:id/send` | `{to,text}` | `{ok:true,mid}` \| `{ok:false,error}` |
+| `GET /instances` | — | `[{id,label,status,connected,phone?,connectedAt?}]` |
+| `POST /instances` | `{name,webhookUrl}` | `{id,label,status,webhookSecret}`; the secret is returned once |
+| `POST /instances/:id/logout` | — | `{ok:true}` (logout + forget auth/registry state) |
+| `GET /instances/:id/qr` | — | `{qr:<raw string>\|null,status,connected}` (`202` while the QR is not ready) |
+| `GET /instances/:id/qr.png` | — | Current QR PNG (`202` while not ready) |
+| `POST /instances/:id/messages/text` | `{to,text}` | `{ok:true,messageId}` |
+| `GET /instances/:id/messages/:mid/media` | — | Original media bytes with their Content-Type |
 
 `status ∈ pairing | connected | disconnected | logged_out`.
-Pairing flow: `POST /accounts {id,label}` → poll `GET /accounts/:id/qr` → render the
-returned data-URL → scan with the phone → `status` flips to `connected` and the QR clears.
+Pairing flow: `POST /instances {name,webhookUrl}` → poll
+`GET /instances/:id/qr` and render `/instances/:id/qr.png` → scan with the phone
+→ `status` flips to `connected` and the QR clears.
 
 ### Outbound events → app webhook
 
-The bridge POSTs to `APP_WEBHOOK_URL` with header
-`X-Bridge-Signature-256: sha256=<hex>` where
-`hex = HMAC_SHA256(key=BRIDGE_WEBHOOK_SECRET, msg=rawBody)` (rawBody = the exact
-JSON string sent). Delivery retries with exponential backoff (1s, 2s, 4s, 8s, 30s)
-then drops-with-log; a webhook failure never crashes the socket.
+Each instance gets its own webhook secret. The bridge POSTs an envelope to that
+instance's webhook URL with `X-WA-Event`, `X-WA-Instance`, and
+`X-WA-Signature: <hex>`, where `hex = HMAC_SHA256(instanceSecret, rawBody)`.
+Delivery retries with exponential backoff (1s, 2s, 4s, 8s, 30s); a webhook
+failure never crashes the socket.
 
 ```jsonc
-// inbound message
-{ "type":"message.in", "accountId":"<id>", "mid":"<wa msg id>",
-  "from":"<digits>", "name":"<pushName?>", "text":"<body>", "timestamp":"<ISO>" }
-
-// account lifecycle
-{ "type":"account.status", "accountId":"<id>",
-  "status":"pairing"|"connected"|"disconnected"|"logged_out", "phone":"<digits?>" }
+{ "event":"message", "instanceId":"<id>", "timestamp":"<ISO>",
+  "data": { "id":"<wa id>", "chatPhone":"<digits>", "pushName":"...",
+    "text":"caption or text", "hasMedia":true,
+    "media": { "type":"image|audio|video|document|sticker",
+      "mimeType":"...", "fileName":"...", "voice":true } } }
 ```
 
-Non-text messages relay as a placeholder (`[image]`, `[document]`, …) matching the
-Cloud webhook convention. Media relay is out of scope for v1.
+Rich media is relayed as structured metadata. The app uses the authenticated
+media endpoint for previews/playback and can transcribe audio when configured.
 
 ---
 
@@ -85,8 +89,8 @@ Cloud webhook convention. Media relay is out of scope for v1.
 
 | Var | Required | Default | Notes |
 |---|---|---|---|
-| `BRIDGE_TOKEN` | ✅ always | — | Bearer token for the admin API. |
-| `BRIDGE_WEBHOOK_SECRET` | ✅ always | — | HMAC key for `X-Bridge-Signature-256`. Must equal the app's `WA_BRIDGE_WEBHOOK_SECRET`. |
+| `BRIDGE_TOKEN` | ✅ always | — | API key; set Vercel `WA_GATEWAY_API_KEY` to the same value. |
+| `BRIDGE_WEBHOOK_SECRET` | optional | `BRIDGE_TOKEN` | Legacy `/accounts` webhook fallback only; `/instances` generates isolated secrets. |
 | `APP_WEBHOOK_URL` | ✅ always | — | Where events are POSTed, e.g. `https://clickdzmax.vercel.app/api/whatsapp/bridge`. |
 | `KV_REST_API_URL` | ✅ when `AUTH_STORE=redis` | — | Upstash Redis REST base URL. |
 | `KV_REST_API_TOKEN` | ✅ when `AUTH_STORE=redis` | — | Upstash Redis REST token. |
@@ -96,6 +100,10 @@ Cloud webhook convention. Media relay is out of scope for v1.
 | `LOG_LEVEL` | optional | `info` | `info` (prod) / `debug` (dev). Message bodies never logged at info. |
 | `SEND_THROTTLE_MS` | optional | `0` | Per-account outbound pacing (ms) for anti-ban. `0` = off. |
 | `AUTH_DISK_DIR` | optional | `./auth_state` | Disk-store root (only when `AUTH_STORE=disk`). |
+| `MEDIA_DIR` | optional | `./media` | Rich-media byte store; use `/var/lib/wa-bridge/media` on a Droplet. |
+| `MAX_MEDIA_BYTES` | optional | `10485760` | Per-message media persistence limit. |
+| `MEDIA_RETENTION_DAYS` | optional | `30` | Deletes expired stored media during periodic cleanup. |
+| `ADMIN_API_KEY` | optional | — | Enables `POST /admin/tenants`; normally set app `WA_GATEWAY_API_KEY=BRIDGE_TOKEN` instead. |
 
 The process **fails fast** with a clear message if a required variable is missing.
 **Zero secrets live in this repo** — it is public so DigitalOcean can clone it
@@ -115,8 +123,9 @@ npm start
 # → GET http://localhost:8080/health  →  {"ok":true,"accounts":0,"uptime":...}
 ```
 
-Then `POST /accounts {id,label}` with the Bearer token, poll `/accounts/:id/qr`,
-and scan the data-URL with a **secondary** WhatsApp number.
+Then `POST /instances {name,webhookUrl}` with `x-api-key: dev-token`, poll
+`/instances/:id/qr`, render `/instances/:id/qr.png`, and scan it with a
+**secondary** WhatsApp number.
 
 ---
 
@@ -153,9 +162,11 @@ python3 digitalocean.py droplets create \
   --user-data "$(cat deploy/cloud-init.sh)"
 ```
 
-Fill the `<FILL:...>` secrets in the script before creating; secrets are embedded at
-create time and live only on the droplet + in DO, never in git. Reach the bridge at
-`http://<droplet-ip>:8080` with the Bearer token.
+Attach a Reserved IP, point a DNS hostname at it, and fill the
+`<FILL:BRIDGE_DOMAIN>` plus secret placeholders before creating. The script puts
+Caddy in front of the private Node port, obtains HTTPS automatically, and
+firewalls public port 8080. Set Vercel `WA_GATEWAY_URL` to that HTTPS hostname;
+never send the API key to a plaintext public origin.
 
 > Railway is intentionally not supported here: its git-source deploys require an
 > interactive GitHub-App install that can't be performed from an HTTPS-only sandbox.
@@ -164,19 +175,15 @@ create time and live only on the droplet + in DO, never in git. Reach the bridge
 
 ## App-side integration contract
 
-The app must set `WA_BRIDGE_URL` (this bridge's base URL), `WA_BRIDGE_TOKEN`
-(= `BRIDGE_TOKEN`), and `WA_BRIDGE_WEBHOOK_SECRET` (= `BRIDGE_WEBHOOK_SECRET`), and
-expose `POST /api/whatsapp/bridge` which:
+Set these on the Vercel project, then redeploy:
 
-1. reads the raw body and verifies `X-Bridge-Signature-256` with
-   `createHmac("sha256", WA_BRIDGE_WEBHOOK_SECRET) + timingSafeEqual` (`401` on
-   mismatch),
-2. dedups `message.in` by `mid`, appends the message, and mirrors an escalation,
-3. updates the account registry on `account.status`,
-4. returns `{ok:true}` fast and never throws.
+- `WA_GATEWAY_URL=https://<bridge-origin>`
+- `WA_GATEWAY_API_KEY=<the bridge BRIDGE_TOKEN>`
+- `APP_BASE_URL=https://clickdzmax.vercel.app`
 
-Console sends route by account mode: `cloud` → Graph API; `qr` → `POST
-{WA_BRIDGE_URL}/accounts/:id/send` with the Bearer token.
+Do not set the retired `WA_BRIDGE_*` variables. Instance creation returns the
+per-instance secret that the app persists server-side and uses to verify the raw
+body signature on `/api/whatsapp/bridge`.
 
 ## Notes / limitations
 

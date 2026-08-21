@@ -13,12 +13,23 @@ export function makeRedis({ url, token }) {
     'Content-Type': 'application/json',
   };
 
+  async function redisFetch(endpoint, body) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10_000);
+    try {
+      return await fetch(endpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async function command(args) {
-    const res = await fetch(base, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(args),
-    });
+    const res = await redisFetch(base, args);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Redis command failed (${res.status}): ${body.slice(0, 200)}`);
@@ -30,11 +41,7 @@ export function makeRedis({ url, token }) {
 
   async function pipeline(commands) {
     if (!commands.length) return [];
-    const res = await fetch(`${base}/pipeline`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(commands),
-    });
+    const res = await redisFetch(`${base}/pipeline`, commands);
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       throw new Error(`Redis pipeline failed (${res.status}): ${body.slice(0, 200)}`);

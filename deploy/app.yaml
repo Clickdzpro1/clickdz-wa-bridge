@@ -52,6 +52,15 @@ services:
       - key: AUTH_STATE_PREFIX
         scope: RUN_TIME
         value: wa:bridge:auth
+      - key: MEDIA_DIR
+        scope: RUN_TIME
+        value: /tmp/wa-bridge-media
+      - key: MAX_MEDIA_BYTES
+        scope: RUN_TIME
+        value: "10485760"
+      - key: MEDIA_RETENTION_DAYS
+        scope: RUN_TIME
+        value: "30"
       - key: LOG_LEVEL
         scope: RUN_TIME
         value: info

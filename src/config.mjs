@@ -31,7 +31,7 @@ export function loadConfig() {
   const authStore = resolveAuthStore();
 
   // Always-required.
-  const required = [req('BRIDGE_TOKEN'), req('BRIDGE_WEBHOOK_SECRET'), req('APP_WEBHOOK_URL')];
+  const required = [req('BRIDGE_TOKEN'), req('APP_WEBHOOK_URL')];
 
   // Redis store additionally requires the Upstash REST pair.
   if (authStore === 'redis') {
@@ -57,7 +57,10 @@ export function loadConfig() {
 
   return {
     bridgeToken: process.env.BRIDGE_TOKEN,
-    bridgeWebhookSecret: process.env.BRIDGE_WEBHOOK_SECRET,
+    adminApiKey: opt('ADMIN_API_KEY', ''),
+    // Legacy /accounts instances use this global fallback. New /instances
+    // receive a generated per-instance secret and never depend on it.
+    bridgeWebhookSecret: opt('BRIDGE_WEBHOOK_SECRET', process.env.BRIDGE_TOKEN),
     appWebhookUrl: process.env.APP_WEBHOOK_URL,
     port,
     authStore, // 'redis' | 'disk'
@@ -66,6 +69,9 @@ export function loadConfig() {
     authStatePrefix: opt('AUTH_STATE_PREFIX', 'wa:bridge:auth'),
     // Local-dev disk store root (only used when authStore === 'disk').
     authDiskDir: opt('AUTH_DISK_DIR', './auth_state'),
+    mediaDir: opt('MEDIA_DIR', './media'),
+    maxMediaBytes: Math.max(1, parseInt(opt('MAX_MEDIA_BYTES', '10485760'), 10) || 10485760),
+    mediaRetentionDays: Math.max(1, parseInt(opt('MEDIA_RETENTION_DAYS', '30'), 10) || 30),
     logLevel: opt('LOG_LEVEL', 'info'),
     // Per-account outbound send throttle (anti-ban pacing); ms between sends.
     sendThrottleMs: parseInt(opt('SEND_THROTTLE_MS', '0'), 10) || 0,

@@ -18,22 +18,23 @@
 #     --image ubuntu-24-04-x64 --tags wa-bridge \
 #     --user-data "$(cat deploy/cloud-init.sh)"
 #
-# BEFORE creating: replace <FILL:BRIDGE_TOKEN> and <FILL:BRIDGE_WEBHOOK_SECRET>
-# with the real secrets. They are embedded at create time and live ONLY on the
-# droplet (/etc/wa-bridge.env, chmod 600) and in DO — never in the public repo.
+# BEFORE creating: point <FILL:BRIDGE_DOMAIN> at the Droplet's Reserved IP, then
+# replace it plus <FILL:BRIDGE_TOKEN> and <FILL:BRIDGE_WEBHOOK_SECRET>. Secrets
+# live ONLY on the droplet (/etc/wa-bridge.env, chmod 600) and in DO.
 #
-# Reach the bridge at http://<droplet-ip>:8080 with Authorization: Bearer <BRIDGE_TOKEN>.
+# Reach the bridge only at https://<FILL:BRIDGE_DOMAIN>; port 8080 is firewalled.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 # --- Node 22 + git ---
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-apt-get install -y nodejs git
+apt-get install -y nodejs git caddy ufw
 
 # --- service user + persistent auth-state dir (survives restarts/reboots) ---
 useradd -m -r -s /usr/sbin/nologin wa || true
 mkdir -p /var/lib/wa-bridge/auth
+mkdir -p /var/lib/wa-bridge/media
 chown -R wa:wa /var/lib/wa-bridge
 
 # --- clone the PUBLIC repo (no auth needed) ---
@@ -49,6 +50,9 @@ BRIDGE_WEBHOOK_SECRET=<FILL:BRIDGE_WEBHOOK_SECRET>
 APP_WEBHOOK_URL=https://clickdzmax.vercel.app/api/whatsapp/bridge
 AUTH_STORE=disk
 AUTH_DISK_DIR=/var/lib/wa-bridge/auth
+MEDIA_DIR=/var/lib/wa-bridge/media
+MAX_MEDIA_BYTES=10485760
+MEDIA_RETENTION_DAYS=30
 LOG_LEVEL=info
 PORT=8080
 ENV
@@ -82,6 +86,24 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now wa-bridge
+
+# --- HTTPS reverse proxy. Never send the API key to a plaintext public origin. ---
+cat >/etc/caddy/Caddyfile <<'CADDY'
+<FILL:BRIDGE_DOMAIN> {
+  reverse_proxy 127.0.0.1:8080
+  encode zstd gzip
+}
+CADDY
+systemctl enable --now caddy
+systemctl reload caddy
+
+# Keep the Node port private; expose only SSH + ACME/HTTPS.
+ufw default deny incoming
+ufw default allow outgoing
+ufw allow OpenSSH
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw --force enable
 
 # --- update path: hourly git-pull that ONLY restarts when HEAD actually moved
 #     (a plain `git pull && restart` restarts every run even with no changes,
