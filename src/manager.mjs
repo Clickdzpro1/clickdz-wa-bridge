@@ -4,6 +4,10 @@ import makeWASocket, {
   downloadMediaMessage,
   fetchLatestBaileysVersion,
   getContentType,
+  isHostedLidUser,
+  isLidUser,
+  isPnUser,
+  normalizeMessageContent,
   jidNormalizedUser,
   makeCacheableSignalKeyStore,
 } from '@whiskeysockets/baileys';
@@ -18,6 +22,30 @@ const HISTORY_LIMIT = 2_000;
 const CHAT_LIMIT = 1_000;
 const LOGOUT_TIMEOUT_MS = 3_000;
 const S_WHATSAPP_NET = '@s.whatsapp.net';
+const BACKFILL_CHAT_LIMIT = 40;
+const BACKFILL_DEFAULT_COUNT = 50;
+
+function isIndividualJid(jid) {
+  return Boolean(
+    typeof jid === 'string' &&
+      (isPnUser(jid) || isLidUser(jid) || isHostedLidUser(jid) || jid.endsWith(S_WHATSAPP_NET))
+  );
+}
+
+function toFiniteNumber(value) {
+  const raw = typeof value === 'number' ? value : Number(value?.low ?? value?.toNumber?.() ?? value);
+  return Number.isFinite(raw) ? raw : null;
+}
+
+function messageKeyForHistory(msg) {
+  if (!msg?.key?.id || !msg.key.remoteJid) return null;
+  return {
+    id: msg.key.id,
+    remoteJid: msg.key.remoteJid,
+    fromMe: Boolean(msg.key.fromMe),
+    ...(msg.key.participant ? { participant: msg.key.participant } : {}),
+  };
+}
 
 function digitsFromJid(jid) {
   if (!jid) return '';
@@ -46,8 +74,12 @@ async function withTimeout(promise, ms) {
   }
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function unwrapMessage(message) {
-  let content = message;
+  let content = normalizeMessageContent(message) || message;
   for (let i = 0; i < 4 && content; i += 1) {
     if (content.ephemeralMessage?.message) content = content.ephemeralMessage.message;
     else if (content.viewOnceMessage?.message) content = content.viewOnceMessage.message;
@@ -55,6 +87,7 @@ function unwrapMessage(message) {
     else if (content.documentWithCaptionMessage?.message)
       content = content.documentWithCaptionMessage.message;
     else break;
+    content = normalizeMessageContent(content) || content;
   }
   return content;
 }
@@ -67,6 +100,45 @@ function extractContent(message) {
   if (type === 'extendedTextMessage') {
     return { text: content.extendedTextMessage?.text || '', media: null };
   }
+  if (type === 'buttonsResponseMessage') {
+    return {
+      text:
+        content.buttonsResponseMessage?.selectedDisplayText ||
+        content.buttonsResponseMessage?.selectedButtonId ||
+        '',
+      media: null,
+    };
+  }
+  if (type === 'listResponseMessage') {
+    return {
+      text:
+        content.listResponseMessage?.title ||
+        content.listResponseMessage?.singleSelectReply?.selectedRowId ||
+        '',
+      media: null,
+    };
+  }
+  if (type === 'templateButtonReplyMessage') {
+    return {
+      text:
+        content.templateButtonReplyMessage?.selectedDisplayText ||
+        content.templateButtonReplyMessage?.selectedId ||
+        '',
+      media: null,
+    };
+  }
+  if (type === 'interactiveResponseMessage') {
+    return {
+      text:
+        content.interactiveResponseMessage?.body?.text ||
+        content.interactiveResponseMessage?.nativeFlowResponseMessage?.name ||
+        '',
+      media: null,
+    };
+  }
+  if (type === 'locationMessage') return { text: '[location]', media: null };
+  if (type === 'contactMessage') return { text: '[contact]', media: null };
+  if (type === 'contactsArrayMessage') return { text: '[contacts]', media: null };
   const mapping = {
     imageMessage: ['image', content.imageMessage],
     videoMessage: ['video', content.videoMessage],
@@ -93,6 +165,33 @@ function extractContent(message) {
 export function makeManager({ config, redis, registry, logger, dispatcher }) {
   const sessions = new Map();
   let cleanupTimer = null;
+
+  function rememberJidMapping(session, lid, pn) {
+    if (!session || !lid || !pn || !isLidUser(lid) || !isPnUser(pn)) return;
+    session.jidMap ||= new Map();
+    session.jidMap.set(lid, pn);
+  }
+
+  function rememberMappingsFromHistory(session, event) {
+    for (const item of event?.lidPnMappings || []) {
+      rememberJidMapping(session, item?.lid, item?.pn);
+    }
+    for (const item of [...(event?.contacts || []), ...(event?.chats || [])]) {
+      rememberJidMapping(session, item?.id || item?.lidJid || item?.accountLid, item?.pnJid || item?.phoneNumber);
+      rememberJidMapping(session, item?.lidJid || item?.accountLid, item?.id || item?.pnJid || item?.phoneNumber);
+    }
+  }
+
+  function resolveChatJid(session, jid) {
+    if (!jid || typeof jid !== 'string') return '';
+    if (isPnUser(jid) || jid.endsWith(S_WHATSAPP_NET)) return jid;
+    return session?.jidMap?.get(jid) || jid;
+  }
+
+  function phoneFromChatJid(session, jid) {
+    const resolved = resolveChatJid(session, jid);
+    return digitsFromJid(resolved) || digitsFromJid(jid);
+  }
 
   function publicView(session) {
     return {
@@ -208,21 +307,25 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     return Number.isNaN(date.valueOf()) ? new Date().toISOString() : date.toISOString();
   }
 
-  function chatRecordFromWa(chat) {
+  function chatRecordFromWa(session, chat) {
     const id = chat?.id || chat?.jid || chat?.remoteJid || '';
-    if (typeof id !== 'string' || !id.endsWith(S_WHATSAPP_NET)) return null;
-    const phone = digitsFromJid(id);
+    rememberJidMapping(session, chat?.lidJid || chat?.accountLid || id, chat?.pnJid || chat?.phoneNumber);
+    if (!isIndividualJid(id)) return null;
+    const resolvedId = resolveChatJid(session, id);
+    const phone = phoneFromChatJid(session, id);
     if (!phone) return null;
     const latestWrapped = Array.isArray(chat.messages) ? chat.messages.at(-1) : null;
     const latestMessage = latestWrapped?.message || latestWrapped;
     const latestContent = latestMessage?.message ? extractContent(latestMessage.message) : null;
+    const latestTimestamp = toFiniteNumber(latestMessage?.messageTimestamp);
     const latestText =
       latestContent?.text ||
       (latestContent?.media ? `[${latestContent.media.type || 'media'}]` : '');
     return {
-      id,
-      chatId: id,
-      chatJid: id,
+      id: resolvedId,
+      chatId: resolvedId,
+      chatJid: resolvedId,
+      ...(resolvedId !== id ? { sourceChatJid: id } : {}),
       chatPhone: phone,
       phone,
       name: chat.name || chat.notify || chat.verifiedName || phone,
@@ -233,6 +336,8 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
           chat.timestamp
       ),
       lastText: latestText,
+      ...(messageKeyForHistory(latestMessage) ? { latestMessageKey: messageKeyForHistory(latestMessage) } : {}),
+      ...(latestTimestamp ? { latestMessageTimestamp: latestTimestamp } : {}),
       messages: [],
     };
   }
@@ -243,7 +348,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     const byPhone = new Map(current.map((item) => [item.phone, item]));
     let changed = 0;
     for (const row of rows) {
-      const next = chatRecordFromWa(row);
+      const next = chatRecordFromWa(session, row);
       if (!next) continue;
       const existing = byPhone.get(next.phone);
       byPhone.set(next.phone, {
@@ -271,17 +376,20 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     let changed = 0;
     for (const row of rows) {
       const id = row?.id || row?.jid || row?.remoteJid || '';
-      if (typeof id !== 'string' || !id.endsWith(S_WHATSAPP_NET)) continue;
-      const phone = digitsFromJid(id);
+      rememberJidMapping(session, row?.lidJid || row?.accountLid || id, row?.pnJid || row?.phoneNumber);
+      if (!isIndividualJid(id)) continue;
+      const resolvedId = resolveChatJid(session, id);
+      const phone = phoneFromChatJid(session, id);
       if (!phone) continue;
       const name = String(row.name || row.notify || row.verifiedName || '').trim();
       if (!name) continue;
       const existing = byPhone.get(phone);
       if (!existing) {
         byPhone.set(phone, {
-          id,
-          chatId: id,
-          chatJid: id,
+          id: resolvedId,
+          chatId: resolvedId,
+          chatJid: resolvedId,
+          ...(resolvedId !== id ? { sourceChatJid: id } : {}),
           chatPhone: phone,
           phone,
           name,
@@ -339,7 +447,10 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
   async function dataFromMessage(session, msg, options = {}) {
     if (!msg.message) return null;
     const remoteJid = msg.key?.remoteJid || '';
-    if (!remoteJid.endsWith(S_WHATSAPP_NET)) return null;
+    if (!isIndividualJid(remoteJid)) return null;
+    const resolvedJid = resolveChatJid(session, remoteJid);
+    const chatPhone = phoneFromChatJid(session, remoteJid);
+    if (!chatPhone) return null;
     const { text, media } = extractContent(msg.message);
     if (!text && !media) return null;
     const messageId = msg.key?.id || '';
@@ -362,8 +473,9 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     const pushName = msg.pushName || options.pushName || null;
     return {
       id: messageId,
-      chatJid: remoteJid,
-      chatPhone: digitsFromJid(remoteJid),
+      chatJid: resolvedJid,
+      ...(resolvedJid !== remoteJid ? { sourceChatJid: remoteJid } : {}),
+      chatPhone,
       sender: msg.key?.participant || remoteJid,
       senderPhone: digitsFromJid(msg.key?.participant || remoteJid),
       pushName,
@@ -374,17 +486,24 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       isGroup: false,
       hasMedia: Boolean(media),
       fromMe: Boolean(msg.key?.fromMe),
+      ...(messageKeyForHistory(msg) ? { sourceMessageKey: messageKeyForHistory(msg) } : {}),
+      ...(toFiniteNumber(msg.messageTimestamp) ? { sourceMessageTimestamp: toFiniteNumber(msg.messageTimestamp) } : {}),
       ...(media ? { media } : {}),
     };
   }
 
-  function contactNamesFromHistory(event) {
+  function contactNamesFromHistory(session, event) {
     const names = new Map();
     for (const item of [...(event.contacts || []), ...(event.chats || [])]) {
       const id = item?.id;
       if (typeof id !== 'string') continue;
       const name = item.name || item.notify || item.verifiedName;
-      if (typeof name === 'string' && name.trim()) names.set(id, name.trim());
+      if (typeof name === 'string' && name.trim()) {
+        const cleaned = name.trim();
+        names.set(id, cleaned);
+        const resolved = resolveChatJid(session, id);
+        if (resolved) names.set(resolved, cleaned);
+      }
     }
     return names;
   }
@@ -402,7 +521,8 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
   }
 
   async function handleHistorySet(session, event) {
-    const names = contactNamesFromHistory(event || {});
+    rememberMappingsFromHistory(session, event || {});
+    const names = contactNamesFromHistory(session, event || {});
     const chatCount = await mergeChats(session, event?.chats || []);
     let imported = 0;
     const historyMessages = historyMessagesFromEvent(event);
@@ -411,7 +531,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
         const remoteJid = msg.key?.remoteJid || '';
         const data = await dataFromMessage(session, msg, {
           downloadMedia: false,
-          pushName: names.get(remoteJid),
+          pushName: names.get(remoteJid) || names.get(resolveChatJid(session, remoteJid)),
         });
         if (data && (await appendHistory(session, data))) imported += 1;
       } catch (err) {
@@ -475,6 +595,41 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       }))
       .sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt))
       .slice(0, Math.min(Math.max(limit, 1), 1_000));
+  }
+
+  async function requestHistorySync(id, { count = BACKFILL_DEFAULT_COUNT } = {}) {
+    const session = sessions.get(id);
+    if (!session) return { ok: false, error: 'instance_not_found', code: 404 };
+    if (session.status !== 'connected' || !session.sock?.fetchMessageHistory) {
+      return { ok: false, error: 'instance_not_connected', code: 409 };
+    }
+
+    const perChat = Math.min(Math.max(Number(count) || BACKFILL_DEFAULT_COUNT, 1), 100);
+    const storedChats = session.chats || (await readChats(id));
+    session.chats = storedChats;
+    const candidates = [...storedChats]
+      .filter((chat) => chat?.latestMessageKey?.id && chat?.latestMessageTimestamp)
+      .sort((a, b) => String(b.lastMessageAt).localeCompare(String(a.lastMessageAt)))
+      .slice(0, BACKFILL_CHAT_LIMIT);
+
+    let requested = 0;
+    let skipped = Math.max(storedChats.length - candidates.length, 0);
+    let failed = 0;
+    for (const chat of candidates) {
+      try {
+        await session.sock.fetchMessageHistory(perChat, chat.latestMessageKey, chat.latestMessageTimestamp);
+        requested += 1;
+        await sleep(250);
+      } catch (err) {
+        failed += 1;
+        logger.warn(
+          { instanceId: id, chatJid: chat.chatJid, err: err.message },
+          'on-demand history request failed'
+        );
+      }
+    }
+    logger.info({ instanceId: id, requested, skipped, failed }, 'on-demand history requested');
+    return { ok: true, requested, skipped, failed };
   }
 
   function setStatus(session, status) {
@@ -557,7 +712,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       },
       version,
       logger,
-      browser: Browsers.macOS('Chrome'),
+      browser: Browsers.macOS('Desktop'),
       markOnlineOnConnect: false,
       keepAliveIntervalMs: 30_000,
       syncFullHistory: true,
@@ -884,6 +1039,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     getMedia,
     listMessages,
     listChats,
+    requestHistorySync,
     send,
     shutdown,
   };
