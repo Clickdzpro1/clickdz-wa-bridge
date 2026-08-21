@@ -11,8 +11,9 @@ import makeWASocket, {
   jidNormalizedUser,
   makeCacheableSignalKeyStore,
 } from '@whiskeysockets/baileys';
-import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { jsonrepair } from 'jsonrepair';
 import QRCode from 'qrcode';
 import { makeAuthState } from './authState.mjs';
 
@@ -251,7 +252,14 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
               throw err;
             });
       if (!raw) return [];
-      const value = JSON.parse(raw);
+      let value;
+      try {
+        value = JSON.parse(raw);
+      } catch (parseError) {
+        value = JSON.parse(jsonrepair(raw));
+        logger.warn({ instanceId, err: parseError.message }, 'repaired truncated history cache');
+        if (Array.isArray(value)) await writeHistory(instanceId, value);
+      }
       return Array.isArray(value) ? value.filter((item) => item && typeof item === 'object') : [];
     } catch (err) {
       logger.warn({ instanceId, err: err.message }, 'history read failed');
@@ -266,7 +274,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       return;
     }
     await mkdir(join(config.authDiskDir, 'history'), { recursive: true });
-    await writeFile(historyDiskPath(instanceId), body, { mode: 0o600 });
+    await atomicWrite(historyDiskPath(instanceId), body);
   }
 
   async function readChats(instanceId) {
@@ -279,7 +287,14 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
               throw err;
             });
       if (!raw) return [];
-      const value = JSON.parse(raw);
+      let value;
+      try {
+        value = JSON.parse(raw);
+      } catch (parseError) {
+        value = JSON.parse(jsonrepair(raw));
+        logger.warn({ instanceId, err: parseError.message }, 'repaired truncated chat cache');
+        if (Array.isArray(value)) await writeChats(instanceId, value);
+      }
       return Array.isArray(value) ? value.filter((item) => item && typeof item === 'object') : [];
     } catch (err) {
       logger.warn({ instanceId, err: err.message }, 'chat roster read failed');
@@ -294,7 +309,18 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       return;
     }
     await mkdir(join(config.authDiskDir, 'chats'), { recursive: true });
-    await writeFile(chatsDiskPath(instanceId), body, { mode: 0o600 });
+    await atomicWrite(chatsDiskPath(instanceId), body);
+  }
+
+  async function atomicWrite(path, body) {
+    const temp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`;
+    try {
+      await writeFile(temp, body, { mode: 0o600 });
+      await rename(temp, path);
+    } catch (err) {
+      await rm(temp, { force: true }).catch(() => undefined);
+      throw err;
+    }
   }
 
   async function archivedInstanceIds() {
