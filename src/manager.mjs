@@ -627,6 +627,15 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       },
       'messaging history cached'
     );
+    if (historyMessages.length > 0 || chatCount > 0) {
+      emit(session, 'history.available', {
+        received: historyMessages.length,
+        imported,
+        chats: chatCount,
+        progress: event?.progress,
+        isLatest: event?.isLatest,
+      });
+    }
   }
 
   async function listMessages(id, limit = HISTORY_LIMIT) {
