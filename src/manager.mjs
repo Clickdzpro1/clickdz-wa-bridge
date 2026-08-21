@@ -297,6 +297,45 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     await writeFile(chatsDiskPath(instanceId), body, { mode: 0o600 });
   }
 
+  async function archivedInstanceIds() {
+    const ids = new Set();
+    if (config.authStore === 'redis') {
+      const prefixes = [
+        `${config.authStatePrefix}:history:`,
+        `${config.authStatePrefix}:chats:`,
+      ];
+      for (const prefix of prefixes) {
+        const keys = await redis.scanAll(`${prefix}*`);
+        for (const key of keys) {
+          const id = key.slice(prefix.length);
+          if (id) ids.add(id);
+        }
+      }
+    } else {
+      for (const kind of ['history', 'chats']) {
+        const files = await readdir(join(config.authDiskDir, kind)).catch((err) => {
+          if (err.code === 'ENOENT') return [];
+          throw err;
+        });
+        for (const file of files) {
+          if (file.endsWith('.json')) ids.add(file.slice(0, -5));
+        }
+      }
+    }
+    return ids;
+  }
+
+  async function listArchives() {
+    const ids = await archivedInstanceIds();
+    const archives = [];
+    for (const id of ids) {
+      if (sessions.has(id)) continue;
+      const [history, chats] = await Promise.all([readHistory(id), readChats(id)]);
+      archives.push({ id, chats: chats.length, messages: history.length });
+    }
+    return archives.sort((a, b) => b.messages - a.messages || b.chats - a.chats);
+  }
+
   function timestampFromAny(value) {
     const raw =
       typeof value === 'number'
@@ -566,9 +605,9 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
 
   async function listMessages(id, limit = HISTORY_LIMIT) {
     const session = sessions.get(id);
-    if (!session) return null;
-    const history = session.history || (await readHistory(id));
-    session.history = history;
+    if (!session && !(await archivedInstanceIds()).has(id)) return null;
+    const history = session?.history || (await readHistory(id));
+    if (session) session.history = history;
     return history.slice(-Math.min(Math.max(limit, 1), HISTORY_LIMIT));
   }
 
@@ -735,6 +774,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
   async function startSocket(session) {
     const auth = await makeAuthState({ config, redis, accountId: session.id, logger });
     session.auth = auth;
+    const isNewPairing = !auth.state.creds.registered;
     let version;
     try {
       ({ version } = await fetchLatestBaileysVersion());
@@ -748,17 +788,17 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       },
       version,
       logger,
-      // The generic Desktop identity is currently rejected during new-device
-      // registration (connectionClosed/428 before WhatsApp emits a QR). Chrome
-      // pairs reliably and still receives full history with the sync options
-      // below enabled.
-      browser: Browsers.macOS('Chrome'),
+      // New registrations require the stable Chrome identity or WhatsApp closes
+      // before emitting a QR. Once paired, reconnect as Desktop so WhatsApp
+      // supplies the larger companion-device history payload.
+      browser: isNewPairing ? Browsers.macOS('Chrome') : Browsers.macOS('Desktop'),
       markOnlineOnConnect: false,
       keepAliveIntervalMs: 30_000,
       syncFullHistory: true,
       shouldSyncHistoryMessage: () => true,
       getMessage: async () => undefined,
     });
+    session.socketMode = isNewPairing ? 'pairing' : 'history';
     session.sock = sock;
     sock.ev.on('creds.update', () => {
       auth.saveCreds().catch((err) =>
@@ -829,6 +869,20 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       emit(session, 'instance.ready', {
         phoneNumber: session.phone ? `+${session.phone}` : null,
       });
+      if (session.socketMode === 'pairing' && !session.historyReconnectTimer) {
+        const pairingSocket = session.sock;
+        session.historyReconnectTimer = setTimeout(() => {
+          session.historyReconnectTimer = null;
+          if (
+            session.deleted ||
+            session.sock !== pairingSocket ||
+            !session.auth?.state?.creds?.registered
+          )
+            return;
+          logger.info({ instanceId: session.id }, 'reconnecting with desktop identity for full history');
+          pairingSocket.end(new Error('switch_to_desktop_history'));
+        }, 2_000);
+      }
     }
     if (connection === 'close') {
       const statusCode =
@@ -924,6 +978,8 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       auth: null,
       reconnectAttempts: 0,
       reconnectTimer: null,
+      historyReconnectTimer: null,
+      socketMode: 'pairing',
       deleted: false,
       lastSendAt: 0,
       history: null,
@@ -971,6 +1027,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     if (!session) return { ok: true };
     session.deleted = true;
     if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+    if (session.historyReconnectTimer) clearTimeout(session.historyReconnectTimer);
     try {
       await withTimeout(session.sock?.logout?.() ?? Promise.resolve(), LOGOUT_TIMEOUT_MS);
     } catch (err) {
@@ -1058,6 +1115,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     for (const session of sessions.values()) {
       session.deleted = true;
       if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+      if (session.historyReconnectTimer) clearTimeout(session.historyReconnectTimer);
       try {
         session.sock?.end?.(undefined);
       } catch {
@@ -1080,6 +1138,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     listMessages,
     listChats,
     requestHistorySync,
+    listArchives,
     send,
     shutdown,
   };

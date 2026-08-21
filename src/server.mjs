@@ -160,6 +160,10 @@ export function createServer({ config, manager, logger, startTime }) {
         return send(res, 200, manager.list());
       }
 
+      if (method === 'GET' && path === '/archives') {
+        return send(res, 200, { archives: await manager.listArchives() });
+      }
+
       if (method === 'POST' && path === '/instances') {
         let body;
         try {
