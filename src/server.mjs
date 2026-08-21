@@ -33,6 +33,19 @@ function apiKeyOk(req, expected) {
   return Boolean(match && secretEqual(match[1], expected));
 }
 
+function adminKeyOk(req, expected) {
+  return Boolean(expected && secretEqual(req.headers['x-admin-key'], expected));
+}
+
+function adminInstanceView(instance) {
+  return {
+    id: instance.id,
+    name: instance.label,
+    status: instance.status,
+    connected: instance.connected,
+  };
+}
+
 async function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -105,11 +118,33 @@ export function createServer({ config, manager, logger, startTime }) {
         });
       }
 
-      if (method === 'POST' && path === '/admin/tenants') {
-        if (!config.adminApiKey || !secretEqual(req.headers['x-admin-key'], config.adminApiKey)) {
+      if (path.startsWith('/admin/')) {
+        if (!adminKeyOk(req, config.adminApiKey)) {
           return send(res, 401, { ok: false, error: 'unauthorized' });
         }
-        return send(res, 200, { apiKey: config.bridgeToken });
+        const instances = manager.list().map(adminInstanceView);
+        if (method === 'POST' && path === '/admin/tenants') {
+          return send(res, 200, { apiKey: config.bridgeToken });
+        }
+        if (method === 'GET' && path === '/admin/tenants') {
+          return send(res, 200, {
+            tenants: [
+              {
+                id: 'default',
+                name: 'clickdzmax',
+                status: 'active',
+                instanceCount: instances.length,
+              },
+            ],
+          });
+        }
+        if (method === 'GET' && path === '/admin/instances') {
+          return send(res, 200, { instances });
+        }
+        if (method === 'GET' && path === '/admin/sessions') {
+          return send(res, 200, { sessions: instances });
+        }
+        return send(res, 404, { ok: false, error: 'not_found' });
       }
 
       if (!apiKeyOk(req, config.bridgeToken)) {

@@ -64,6 +64,10 @@ Pairing flow: `POST /instances {name,webhookUrl}` → poll
 `GET /instances/:id/qr` and render `/instances/:id/qr.png` → scan with the phone
 → `status` flips to `connected` and the QR clears.
 
+Admin diagnostics use `x-admin-key: $ADMIN_API_KEY` and return sanitized status
+only: `GET /admin/tenants`, `GET /admin/instances`, and `GET /admin/sessions`.
+`POST /admin/tenants` returns the tenant API key for app self-provisioning.
+
 ### Outbound events → app webhook
 
 Each instance gets its own webhook secret. The bridge POSTs an envelope to that
@@ -103,7 +107,7 @@ media endpoint for previews/playback and can transcribe audio when configured.
 | `MEDIA_DIR` | optional | `./media` | Rich-media byte store; use `/var/lib/wa-bridge/media` on a Droplet. |
 | `MAX_MEDIA_BYTES` | optional | `10485760` | Per-message media persistence limit. |
 | `MEDIA_RETENTION_DAYS` | optional | `30` | Deletes expired stored media during periodic cleanup. |
-| `ADMIN_API_KEY` | optional | — | Enables `POST /admin/tenants`; normally set app `WA_GATEWAY_API_KEY=BRIDGE_TOKEN` instead. |
+| `ADMIN_API_KEY` | optional | — | Enables admin diagnostics and `POST /admin/tenants`; normally set app `WA_GATEWAY_API_KEY=BRIDGE_TOKEN` instead. |
 
 The process **fails fast** with a clear message if a required variable is missing.
 **Zero secrets live in this repo** — it is public so DigitalOcean can clone it
