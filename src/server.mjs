@@ -227,6 +227,15 @@ export function createServer({ config, manager, logger, startTime }) {
           return messages ? send(res, 200, { messages }) : send(res, 404, { ok: false, error: 'instance_not_found' });
         }
         if (method === 'GET' && segments.length === 3 && segments[2] === 'history') {
+          if (url.searchParams.get('page') === 'true' || url.searchParams.has('cursor')) {
+            const page = await manager.listHistoryPage(id, {
+              cursor: url.searchParams.get('cursor'),
+              limit: limitFromUrl(url, 150),
+            });
+            return page
+              ? send(res, 200, { history: page.messages, ...page, messages: undefined })
+              : send(res, 404, { ok: false, error: 'instance_not_found' });
+          }
           const history = await manager.listMessages(id, limitFromUrl(url, 1000));
           return history ? send(res, 200, { history }) : send(res, 404, { ok: false, error: 'instance_not_found' });
         }

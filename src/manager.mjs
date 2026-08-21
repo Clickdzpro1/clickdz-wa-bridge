@@ -19,7 +19,7 @@ import { makeAuthState } from './authState.mjs';
 
 const MAX_BACKOFF_MS = 60_000;
 const BASE_BACKOFF_MS = 2_000;
-const HISTORY_LIMIT = 2_000;
+const HISTORY_LIMIT = 10_000;
 const CHAT_LIMIT = 1_000;
 const LOGOUT_TIMEOUT_MS = 3_000;
 const S_WHATSAPP_NET = '@s.whatsapp.net';
@@ -224,6 +224,31 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       instanceId: session.id,
       data,
     });
+  }
+
+  function queueHistoryAvailable(session, data) {
+    const current = session.historyWebhookStats || {
+      received: 0,
+      imported: 0,
+      chats: 0,
+      progress: undefined,
+      isLatest: false,
+    };
+    session.historyWebhookStats = {
+      received: current.received + Number(data.received || 0),
+      imported: current.imported + Number(data.imported || 0),
+      chats: current.chats + Number(data.chats || 0),
+      progress: data.progress ?? current.progress,
+      isLatest: Boolean(current.isLatest || data.isLatest),
+    };
+    if (session.historyWebhookTimer) return;
+    session.historyWebhookTimer = setTimeout(() => {
+      session.historyWebhookTimer = null;
+      const payload = session.historyWebhookStats;
+      session.historyWebhookStats = null;
+      if (!session.deleted && payload) emit(session, 'history.available', payload);
+    }, 4_000);
+    session.historyWebhookTimer.unref();
   }
 
   function historyKey(instanceId) {
@@ -628,7 +653,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       'messaging history cached'
     );
     if (historyMessages.length > 0 || chatCount > 0) {
-      emit(session, 'history.available', {
+      queueHistoryAvailable(session, {
         received: historyMessages.length,
         imported,
         chats: chatCount,
@@ -644,6 +669,46 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     const history = session?.history || (await readHistory(id));
     if (session) session.history = history;
     return history.slice(-Math.min(Math.max(limit, 1), HISTORY_LIMIT));
+  }
+
+  function historyCursorKey(message) {
+    return `${String(message.timestamp || '')}\u0000${historyDedupKey(message)}`;
+  }
+
+  function encodeHistoryCursor(key) {
+    return Buffer.from(key, 'utf8').toString('base64url');
+  }
+
+  function decodeHistoryCursor(value) {
+    if (!value) return null;
+    try {
+      const decoded = Buffer.from(String(value), 'base64url').toString('utf8');
+      return decoded.includes('\u0000') ? decoded : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function listHistoryPage(id, { cursor, limit = 150 } = {}) {
+    const session = sessions.get(id);
+    if (!session && !(await archivedInstanceIds()).has(id)) return null;
+    const history = session?.history || (await readHistory(id));
+    if (session) session.history = history;
+    const before = decodeHistoryCursor(cursor);
+    const eligible = history
+      .filter((message) => !before || historyCursorKey(message) < before)
+      .sort((a, b) => historyCursorKey(b).localeCompare(historyCursorKey(a)));
+    const pageSize = Math.min(Math.max(Number(limit) || 150, 1), 300);
+    const messages = eligible.slice(0, pageSize);
+    const hasMore = eligible.length > messages.length;
+    return {
+      messages,
+      nextCursor: hasMore && messages.length > 0
+        ? encodeHistoryCursor(historyCursorKey(messages.at(-1)))
+        : null,
+      hasMore,
+      total: history.length,
+    };
   }
 
   async function listChats(id, { includeMessages = false, limit = 500 } = {}) {
@@ -680,6 +745,14 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
         ...chat,
         messages: includeMessages ? chat.messages.sort((a, b) => a.timestamp.localeCompare(b.timestamp)) : undefined,
       }))
+      .filter((chat) =>
+        Boolean(
+          chat.lastText ||
+          chat.latestMessageKey?.id ||
+          (chat.messages && chat.messages.length > 0) ||
+          (chat.lastMessageAt && chat.lastMessageAt > new Date(0).toISOString())
+        )
+      )
       .sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt))
       .slice(0, Math.min(Math.max(limit, 1), 1_000));
   }
@@ -1014,6 +1087,8 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       reconnectAttempts: 0,
       reconnectTimer: null,
       historyReconnectTimer: null,
+      historyWebhookTimer: null,
+      historyWebhookStats: null,
       socketMode: 'pairing',
       deleted: false,
       lastSendAt: 0,
@@ -1063,6 +1138,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     session.deleted = true;
     if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
     if (session.historyReconnectTimer) clearTimeout(session.historyReconnectTimer);
+    if (session.historyWebhookTimer) clearTimeout(session.historyWebhookTimer);
     try {
       await withTimeout(session.sock?.logout?.() ?? Promise.resolve(), LOGOUT_TIMEOUT_MS);
     } catch (err) {
@@ -1151,6 +1227,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       session.deleted = true;
       if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
       if (session.historyReconnectTimer) clearTimeout(session.historyReconnectTimer);
+      if (session.historyWebhookTimer) clearTimeout(session.historyWebhookTimer);
       try {
         session.sock?.end?.(undefined);
       } catch {
@@ -1171,6 +1248,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     getQrPng,
     getMedia,
     listMessages,
+    listHistoryPage,
     listChats,
     requestHistorySync,
     listArchives,
