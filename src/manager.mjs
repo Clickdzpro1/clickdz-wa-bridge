@@ -347,6 +347,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     const current = session.chats || (await readChats(session.id));
     const byPhone = new Map(current.map((item) => [item.phone, item]));
     let changed = 0;
+    let latestImported = 0;
     for (const row of rows) {
       const next = chatRecordFromWa(session, row);
       if (!next) continue;
@@ -359,6 +360,15 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
           ? existing.lastMessageAt
           : next.lastMessageAt,
       });
+      const latestWrapped = Array.isArray(row.messages) ? row.messages.at(-1) : null;
+      const latestMessage = latestWrapped?.message || latestWrapped;
+      if (latestMessage?.key && latestMessage?.message) {
+        const data = await dataFromMessage(session, latestMessage, {
+          downloadMedia: false,
+          pushName: next.name,
+        });
+        if (data && (await appendHistory(session, data))) latestImported += 1;
+      }
       changed += 1;
     }
     const sorted = [...byPhone.values()]
@@ -366,6 +376,9 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       .slice(0, CHAT_LIMIT);
     session.chats = sorted;
     await writeChats(session.id, sorted);
+    if (latestImported > 0) {
+      logger.info({ instanceId: session.id, imported: latestImported }, 'latest chat messages cached');
+    }
     return changed;
   }
 
@@ -597,6 +610,29 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       .slice(0, Math.min(Math.max(limit, 1), 1_000));
   }
 
+  async function runHistoryBackfill(session, id, candidates, perChat) {
+    let requested = 0;
+    let failed = 0;
+    try {
+      for (const chat of candidates) {
+        try {
+          await session.sock.fetchMessageHistory(perChat, chat.latestMessageKey, chat.latestMessageTimestamp);
+          requested += 1;
+          await sleep(250);
+        } catch (err) {
+          failed += 1;
+          logger.warn(
+            { instanceId: id, chatJid: chat.chatJid, err: err.message },
+            'on-demand history request failed'
+          );
+        }
+      }
+      logger.info({ instanceId: id, requested, failed }, 'on-demand history finished');
+    } finally {
+      session.historySyncRunning = false;
+    }
+  }
+
   async function requestHistorySync(id, { count = BACKFILL_DEFAULT_COUNT } = {}) {
     const session = sessions.get(id);
     if (!session) return { ok: false, error: 'instance_not_found', code: 404 };
@@ -612,24 +648,24 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       .sort((a, b) => String(b.lastMessageAt).localeCompare(String(a.lastMessageAt)))
       .slice(0, BACKFILL_CHAT_LIMIT);
 
-    let requested = 0;
     let skipped = Math.max(storedChats.length - candidates.length, 0);
-    let failed = 0;
-    for (const chat of candidates) {
-      try {
-        await session.sock.fetchMessageHistory(perChat, chat.latestMessageKey, chat.latestMessageTimestamp);
-        requested += 1;
-        await sleep(250);
-      } catch (err) {
-        failed += 1;
-        logger.warn(
-          { instanceId: id, chatJid: chat.chatJid, err: err.message },
-          'on-demand history request failed'
-        );
-      }
+    if (candidates.length === 0) {
+      logger.info({ instanceId: id, skipped }, 'on-demand history skipped: no message keys');
+      return { ok: true, queued: false, requested: 0, skipped, failed: 0 };
     }
-    logger.info({ instanceId: id, requested, skipped, failed }, 'on-demand history requested');
-    return { ok: true, requested, skipped, failed };
+    if (session.historySyncRunning) {
+      logger.info({ instanceId: id, candidates: candidates.length, skipped }, 'on-demand history already running');
+      return { ok: true, queued: true, requested: 0, candidates: candidates.length, skipped, failed: 0 };
+    }
+    session.historySyncRunning = true;
+    setTimeout(() => {
+      runHistoryBackfill(session, id, candidates, perChat).catch((err) => {
+        session.historySyncRunning = false;
+        logger.error({ instanceId: id, err: err.message }, 'on-demand history worker crashed');
+      });
+    }, 0).unref();
+    logger.info({ instanceId: id, candidates: candidates.length, skipped }, 'on-demand history queued');
+    return { ok: true, queued: true, requested: 0, candidates: candidates.length, skipped, failed: 0 };
   }
 
   function setStatus(session, status) {
