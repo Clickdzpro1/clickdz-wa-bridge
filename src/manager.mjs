@@ -14,6 +14,7 @@ import { makeAuthState } from './authState.mjs';
 
 const MAX_BACKOFF_MS = 60_000;
 const BASE_BACKOFF_MS = 2_000;
+const HISTORY_LIMIT = 2_000;
 const S_WHATSAPP_NET = '@s.whatsapp.net';
 
 function digitsFromJid(jid) {
@@ -109,6 +110,195 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     });
   }
 
+  function historyKey(instanceId) {
+    return `${config.authStatePrefix}:history:${instanceId}`;
+  }
+
+  function historyDiskPath(instanceId) {
+    return join(config.authDiskDir, 'history', `${safeSegment(instanceId)}.json`);
+  }
+
+  async function readHistory(instanceId) {
+    try {
+      const raw =
+        config.authStore === 'redis'
+          ? await redis.get(historyKey(instanceId))
+          : await readFile(historyDiskPath(instanceId), 'utf8').catch((err) => {
+              if (err.code === 'ENOENT') return null;
+              throw err;
+            });
+      if (!raw) return [];
+      const value = JSON.parse(raw);
+      return Array.isArray(value) ? value.filter((item) => item && typeof item === 'object') : [];
+    } catch (err) {
+      logger.warn({ instanceId, err: err.message }, 'history read failed');
+      return [];
+    }
+  }
+
+  async function writeHistory(instanceId, messages) {
+    const body = JSON.stringify(messages.slice(-HISTORY_LIMIT));
+    if (config.authStore === 'redis') {
+      await redis.set(historyKey(instanceId), body);
+      return;
+    }
+    await mkdir(join(config.authDiskDir, 'history'), { recursive: true });
+    await writeFile(historyDiskPath(instanceId), body, { mode: 0o600 });
+  }
+
+  function historyDedupKey(message) {
+    return message.id
+      ? `id:${message.id}`
+      : `fallback:${message.chatJid}:${message.fromMe ? 'out' : 'in'}:${message.timestamp}:${message.text}`;
+  }
+
+  async function appendHistory(session, message) {
+    const current = session.history || (await readHistory(session.id));
+    const key = historyDedupKey(message);
+    if (current.some((item) => historyDedupKey(item) === key)) {
+      session.history = current;
+      return false;
+    }
+    const next = [...current, message]
+      .sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)))
+      .slice(-HISTORY_LIMIT);
+    session.history = next;
+    await writeHistory(session.id, next);
+    return true;
+  }
+
+  function timestampFromMessage(msg) {
+    const raw = msg.messageTimestamp;
+    const seconds =
+      typeof raw === 'number' ? raw : Number(raw?.low ?? raw) || Math.floor(Date.now() / 1000);
+    const millis = seconds < 10_000_000_000 ? seconds * 1000 : seconds;
+    const date = new Date(millis);
+    return Number.isNaN(date.valueOf()) ? new Date().toISOString() : date.toISOString();
+  }
+
+  async function dataFromMessage(session, msg, options = {}) {
+    if (!msg.message) return null;
+    const remoteJid = msg.key?.remoteJid || '';
+    if (!remoteJid.endsWith(S_WHATSAPP_NET)) return null;
+    const { text, media } = extractContent(msg.message);
+    if (!text && !media) return null;
+    const messageId = msg.key?.id || '';
+    if (options.downloadMedia !== false && media && messageId) {
+      try {
+        const bytes = await downloadMediaMessage(
+          msg,
+          'buffer',
+          {},
+          { logger, reuploadRequest: session.sock?.updateMediaMessage }
+        );
+        await persistMedia(session.id, messageId, bytes, media);
+      } catch (err) {
+        logger.warn(
+          { instanceId: session.id, messageId, err: err.message },
+          'media download failed; metadata will still be relayed'
+        );
+      }
+    }
+    const pushName = msg.pushName || options.pushName || null;
+    return {
+      id: messageId,
+      chatJid: remoteJid,
+      chatPhone: digitsFromJid(remoteJid),
+      sender: msg.key?.participant || remoteJid,
+      senderPhone: digitsFromJid(msg.key?.participant || remoteJid),
+      pushName,
+      text,
+      body: text,
+      message: text,
+      timestamp: timestampFromMessage(msg),
+      isGroup: false,
+      hasMedia: Boolean(media),
+      fromMe: Boolean(msg.key?.fromMe),
+      ...(media ? { media } : {}),
+    };
+  }
+
+  function contactNamesFromHistory(event) {
+    const names = new Map();
+    for (const item of [...(event.contacts || []), ...(event.chats || [])]) {
+      const id = item?.id;
+      if (typeof id !== 'string') continue;
+      const name = item.name || item.notify || item.verifiedName;
+      if (typeof name === 'string' && name.trim()) names.set(id, name.trim());
+    }
+    return names;
+  }
+
+  async function handleHistorySet(session, event) {
+    const names = contactNamesFromHistory(event || {});
+    let imported = 0;
+    for (const msg of event?.messages || []) {
+      try {
+        const remoteJid = msg.key?.remoteJid || '';
+        const data = await dataFromMessage(session, msg, {
+          downloadMedia: false,
+          pushName: names.get(remoteJid),
+        });
+        if (data && (await appendHistory(session, data))) imported += 1;
+      } catch (err) {
+        logger.warn({ instanceId: session.id, err: err.message }, 'history message import failed');
+      }
+    }
+    logger.info(
+      {
+        instanceId: session.id,
+        imported,
+        received: Array.isArray(event?.messages) ? event.messages.length : 0,
+        progress: event?.progress,
+        isLatest: event?.isLatest,
+      },
+      'messaging history cached'
+    );
+  }
+
+  async function listMessages(id, limit = HISTORY_LIMIT) {
+    const session = sessions.get(id);
+    if (!session) return null;
+    const history = session.history || (await readHistory(id));
+    session.history = history;
+    return history.slice(-Math.min(Math.max(limit, 1), HISTORY_LIMIT));
+  }
+
+  async function listChats(id, { includeMessages = false, limit = 500 } = {}) {
+    const history = await listMessages(id, HISTORY_LIMIT);
+    if (!history) return null;
+    const chats = new Map();
+    for (const message of history) {
+      const phone = message.chatPhone || digitsFromJid(message.chatJid);
+      if (!phone) continue;
+      const existing =
+        chats.get(phone) ||
+        {
+          id: message.chatJid,
+          chatId: message.chatJid,
+          chatJid: message.chatJid,
+          chatPhone: phone,
+          phone,
+          name: message.pushName || phone,
+          lastMessageAt: message.timestamp,
+          lastText: message.text || '',
+          messages: [],
+        };
+      if (message.pushName) existing.name = message.pushName;
+      existing.lastMessageAt = message.timestamp;
+      existing.lastText = message.text || existing.lastText;
+      if (includeMessages) existing.messages.push(message);
+      chats.set(phone, existing);
+    }
+    return [...chats.values()]
+      .map((chat) => ({
+        ...chat,
+        messages: includeMessages ? chat.messages.sort((a, b) => a.timestamp.localeCompare(b.timestamp)) : undefined,
+      }))
+      .sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt))
+      .slice(0, Math.min(Math.max(limit, 1), 1_000));
+  }
+
   function setStatus(session, status) {
     if (session.status === status) return false;
     session.status = status;
@@ -192,7 +382,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       browser: Browsers.macOS('Chrome'),
       markOnlineOnConnect: false,
       keepAliveIntervalMs: 30_000,
-      syncFullHistory: false,
+      syncFullHistory: true,
       getMessage: async () => undefined,
     });
     session.sock = sock;
@@ -209,6 +399,11 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     sock.ev.on('messages.upsert', (event) => {
       handleMessagesUpsert(session, event).catch((err) =>
         logger.error({ instanceId: session.id, err: err.message }, 'message handler crashed')
+      );
+    });
+    sock.ev.on('messaging-history.set', (event) => {
+      handleHistorySet(session, event).catch((err) =>
+        logger.error({ instanceId: session.id, err: err.message }, 'history handler crashed')
       );
     });
   }
@@ -291,48 +486,11 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     if (event.type !== 'notify') return;
     for (const msg of event.messages || []) {
       try {
-        if (!msg.message) continue;
-        const remoteJid = msg.key?.remoteJid || '';
-        if (!remoteJid.endsWith(S_WHATSAPP_NET)) continue;
-        const { text, media } = extractContent(msg.message);
-        if (!text && !media) continue;
-        const messageId = msg.key?.id || '';
-        if (media && messageId) {
-          try {
-            const bytes = await downloadMediaMessage(
-              msg,
-              'buffer',
-              {},
-              { logger, reuploadRequest: session.sock?.updateMediaMessage }
-            );
-            await persistMedia(session.id, messageId, bytes, media);
-          } catch (err) {
-            logger.warn(
-              { instanceId: session.id, messageId, err: err.message },
-              'media download failed; metadata will still be relayed'
-            );
-          }
-        }
-        const timestampSeconds =
-          typeof msg.messageTimestamp === 'number'
-            ? msg.messageTimestamp
-            : Number(msg.messageTimestamp?.low ?? msg.messageTimestamp) || Math.floor(Date.now() / 1000);
-        const data = {
-          id: messageId,
-          chatJid: remoteJid,
-          chatPhone: digitsFromJid(remoteJid),
-          sender: msg.key?.participant || remoteJid,
-          senderPhone: digitsFromJid(msg.key?.participant || remoteJid),
-          pushName: msg.pushName || null,
-          text,
-          timestamp: new Date(timestampSeconds * 1000).toISOString(),
-          isGroup: false,
-          hasMedia: Boolean(media),
-          fromMe: Boolean(msg.key?.fromMe),
-          ...(media ? { media } : {}),
-        };
+        const data = await dataFromMessage(session, msg);
+        if (!data) continue;
+        await appendHistory(session, data);
         emit(session, msg.key?.fromMe ? 'message.sent' : 'message', data);
-        logger.debug({ instanceId: session.id, messageId }, 'message relayed');
+        logger.debug({ instanceId: session.id, messageId: data.id }, 'message relayed');
       } catch (err) {
         logger.error({ instanceId: session.id, err: err.message }, 'failed handling message');
       }
@@ -371,6 +529,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       reconnectTimer: null,
       deleted: false,
       lastSendAt: 0,
+      history: null,
     };
     sessions.set(id, session);
     if (options.persist !== false) await persistRegistry();
@@ -471,8 +630,24 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     }
     try {
       const jid = jidNormalizedUser(jidFromDigits(to));
-      const sent = await session.sock.sendMessage(jid, { text: text.slice(0, 4000) });
+      const body = text.slice(0, 4000);
+      const sent = await session.sock.sendMessage(jid, { text: body });
       session.lastSendAt = Date.now();
+      await appendHistory(session, {
+        id: sent?.key?.id || '',
+        chatJid: jid,
+        chatPhone: digitsFromJid(jid),
+        sender: jid,
+        senderPhone: digitsFromJid(jid),
+        pushName: null,
+        text: body,
+        body,
+        message: body,
+        timestamp: new Date().toISOString(),
+        isGroup: false,
+        hasMedia: false,
+        fromMe: true,
+      });
       return { ok: true, messageId: sent?.key?.id };
     } catch (err) {
       logger.error({ instanceId: id, err: err.message }, 'send failed');
@@ -504,6 +679,8 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     getQr,
     getQrPng,
     getMedia,
+    listMessages,
+    listChats,
     send,
     shutdown,
   };

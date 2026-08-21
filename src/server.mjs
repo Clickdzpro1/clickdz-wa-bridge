@@ -46,6 +46,11 @@ function adminInstanceView(instance) {
   };
 }
 
+function limitFromUrl(url, fallback) {
+  const value = Number(url.searchParams.get('limit'));
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
 async function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -205,6 +210,21 @@ export function createServer({ config, manager, logger, startTime }) {
           return out.body
             ? sendBinary(res, 200, out.body, 'image/png')
             : send(res, out.status, { ok: false, error: out.status === 202 ? 'not_ready' : 'instance_not_found' });
+        }
+        if (method === 'GET' && segments.length === 3 && segments[2] === 'chats') {
+          const chats = await manager.listChats(id, {
+            includeMessages: url.searchParams.get('includeMessages') === 'true',
+            limit: limitFromUrl(url, 500),
+          });
+          return chats ? send(res, 200, { chats }) : send(res, 404, { ok: false, error: 'instance_not_found' });
+        }
+        if (method === 'GET' && segments.length === 3 && segments[2] === 'messages') {
+          const messages = await manager.listMessages(id, limitFromUrl(url, 1000));
+          return messages ? send(res, 200, { messages }) : send(res, 404, { ok: false, error: 'instance_not_found' });
+        }
+        if (method === 'GET' && segments.length === 3 && segments[2] === 'history') {
+          const history = await manager.listMessages(id, limitFromUrl(url, 1000));
+          return history ? send(res, 200, { history }) : send(res, 404, { ok: false, error: 'instance_not_found' });
         }
         if (method === 'POST' && segments.length === 3 && segments[2] === 'logout') {
           return send(res, 200, await manager.remove(id));

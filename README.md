@@ -56,6 +56,9 @@ All other endpoints require `x-api-key: $BRIDGE_TOKEN` (the legacy
 | `POST /instances/:id/logout` | — | `{ok:true}` (logout + forget auth/registry state) |
 | `GET /instances/:id/qr` | — | `{qr:<raw string>\|null,status,connected}` (`202` while the QR is not ready) |
 | `GET /instances/:id/qr.png` | — | Current QR PNG (`202` while not ready) |
+| `GET /instances/:id/chats?includeMessages=true` | — | Cached 1:1 chats grouped by phone, with optional recent messages |
+| `GET /instances/:id/history` | — | Cached recent messages from live traffic and WhatsApp initial history sync |
+| `GET /instances/:id/messages` | — | Same cached recent message list for gateway compatibility |
 | `POST /instances/:id/messages/text` | `{to,text}` | `{ok:true,messageId}` |
 | `GET /instances/:id/messages/:mid/media` | — | Original media bytes with their Content-Type |
 
