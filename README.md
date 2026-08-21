@@ -34,9 +34,10 @@ The Meta **Cloud API** channel stays as-is; QR accounts are additive.
 - **Inbound:** `messages.upsert` (1:1 text and rich media) → a per-instance HMAC
   signed POST to the app. Media bytes are retained under `MEDIA_DIR` and fetched
   through the authenticated media endpoint; tokens never reach the browser.
-- **History sync:** Baileys runs as `Browsers.macOS('Desktop')` with
-  `syncFullHistory: true` and ingests all history chunks. A Chrome browser
-  identity can prevent WhatsApp from sending the companion-device history.
+- **History sync:** Baileys pairs with the stable Chrome browser identity and
+  explicitly opts into all history chunks (`shouldSyncHistoryMessage: () => true`).
+  This keeps QR generation reliable while still caching `FULL` history payloads
+  when WhatsApp sends them.
 - **Outbound (app→WhatsApp):** `POST /instances/:id/messages/text` with
   `x-api-key: $BRIDGE_TOKEN`.
 - **Single-instance invariant:** exactly one process; Baileys holds one live

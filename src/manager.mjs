@@ -520,7 +520,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       },
       version,
       logger,
-      browser: Browsers.macOS('Desktop'),
+      browser: Browsers.macOS('Chrome'),
       markOnlineOnConnect: false,
       keepAliveIntervalMs: 30_000,
       syncFullHistory: true,
