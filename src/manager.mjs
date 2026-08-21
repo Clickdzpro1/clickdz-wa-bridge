@@ -16,6 +16,7 @@ const MAX_BACKOFF_MS = 60_000;
 const BASE_BACKOFF_MS = 2_000;
 const HISTORY_LIMIT = 2_000;
 const CHAT_LIMIT = 1_000;
+const LOGOUT_TIMEOUT_MS = 3_000;
 const S_WHATSAPP_NET = '@s.whatsapp.net';
 
 function digitsFromJid(jid) {
@@ -29,6 +30,20 @@ function jidFromDigits(to) {
 
 function safeSegment(value) {
   return String(value || '').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 256);
+}
+
+async function withTimeout(promise, ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(undefined), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function unwrapMessage(message) {
@@ -198,6 +213,12 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     if (typeof id !== 'string' || !id.endsWith(S_WHATSAPP_NET)) return null;
     const phone = digitsFromJid(id);
     if (!phone) return null;
+    const latestWrapped = Array.isArray(chat.messages) ? chat.messages.at(-1) : null;
+    const latestMessage = latestWrapped?.message || latestWrapped;
+    const latestContent = latestMessage?.message ? extractContent(latestMessage.message) : null;
+    const latestText =
+      latestContent?.text ||
+      (latestContent?.media ? `[${latestContent.media.type || 'media'}]` : '');
     return {
       id,
       chatId: id,
@@ -206,9 +227,12 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       phone,
       name: chat.name || chat.notify || chat.verifiedName || phone,
       lastMessageAt: timestampFromAny(
-        chat.lastMessageRecvTimestamp ?? chat.conversationTimestamp ?? chat.timestamp
+        latestMessage?.messageTimestamp ??
+          chat.lastMessageRecvTimestamp ??
+          chat.conversationTimestamp ??
+          chat.timestamp
       ),
-      lastText: '',
+      lastText: latestText,
       messages: [],
     };
   }
@@ -365,11 +389,24 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     return names;
   }
 
+  function historyMessagesFromEvent(event) {
+    const messages = Array.isArray(event?.messages) ? [...event.messages] : [];
+    for (const chat of event?.chats || []) {
+      const wrapped = Array.isArray(chat?.messages) ? chat.messages : [];
+      for (const item of wrapped) {
+        const message = item?.message || item;
+        if (message?.key && message?.message) messages.push(message);
+      }
+    }
+    return messages;
+  }
+
   async function handleHistorySet(session, event) {
     const names = contactNamesFromHistory(event || {});
     const chatCount = await mergeChats(session, event?.chats || []);
     let imported = 0;
-    for (const msg of event?.messages || []) {
+    const historyMessages = historyMessagesFromEvent(event);
+    for (const msg of historyMessages) {
       try {
         const remoteJid = msg.key?.remoteJid || '';
         const data = await dataFromMessage(session, msg, {
@@ -386,7 +423,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
         instanceId: session.id,
         imported,
         chats: chatCount,
-        received: Array.isArray(event?.messages) ? event.messages.length : 0,
+        received: historyMessages.length,
         progress: event?.progress,
         isLatest: event?.isLatest,
       },
@@ -740,7 +777,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     session.deleted = true;
     if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
     try {
-      await session.sock?.logout();
+      await withTimeout(session.sock?.logout?.() ?? Promise.resolve(), LOGOUT_TIMEOUT_MS);
     } catch (err) {
       logger.warn({ instanceId: id, err: err.message }, 'logout failed during delete');
     }
