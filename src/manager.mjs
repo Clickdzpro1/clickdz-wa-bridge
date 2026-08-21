@@ -240,6 +240,48 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     return changed;
   }
 
+  async function mergeContacts(session, rows) {
+    if (!Array.isArray(rows) || rows.length === 0) return 0;
+    const current = session.chats || (await readChats(session.id));
+    const byPhone = new Map(current.map((item) => [item.phone, item]));
+    let changed = 0;
+    for (const row of rows) {
+      const id = row?.id || row?.jid || row?.remoteJid || '';
+      if (typeof id !== 'string' || !id.endsWith(S_WHATSAPP_NET)) continue;
+      const phone = digitsFromJid(id);
+      if (!phone) continue;
+      const name = String(row.name || row.notify || row.verifiedName || '').trim();
+      if (!name) continue;
+      const existing = byPhone.get(phone);
+      if (!existing) {
+        byPhone.set(phone, {
+          id,
+          chatId: id,
+          chatJid: id,
+          chatPhone: phone,
+          phone,
+          name,
+          lastMessageAt: new Date(0).toISOString(),
+          lastText: '',
+          messages: [],
+        });
+        changed += 1;
+        continue;
+      }
+      if (existing.name !== name) {
+        byPhone.set(phone, { ...existing, name });
+        changed += 1;
+      }
+    }
+    if (changed === 0) return 0;
+    const sorted = [...byPhone.values()]
+      .sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt))
+      .slice(0, CHAT_LIMIT);
+    session.chats = sorted;
+    await writeChats(session.id, sorted);
+    return changed;
+  }
+
   function historyDedupKey(message) {
     return message.id
       ? `id:${message.id}`
@@ -384,7 +426,8 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
         };
       if (message.pushName) existing.name = message.pushName;
       existing.lastMessageAt = message.timestamp;
-      existing.lastText = message.text || existing.lastText;
+      existing.lastText =
+        message.text || (message.hasMedia ? `[${message.media?.type || 'media'}]` : existing.lastText);
       if (includeMessages) existing.messages.push(message);
       chats.set(phone, existing);
     }
@@ -477,10 +520,11 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       },
       version,
       logger,
-      browser: Browsers.macOS('Chrome'),
+      browser: Browsers.macOS('Desktop'),
       markOnlineOnConnect: false,
       keepAliveIntervalMs: 30_000,
       syncFullHistory: true,
+      shouldSyncHistoryMessage: () => true,
       getMessage: async () => undefined,
     });
     session.sock = sock;
@@ -504,6 +548,9 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
         logger.error({ instanceId: session.id, err: err.message }, 'history handler crashed')
       );
     });
+    sock.ev.on('messaging-history.status', (event) => {
+      logger.info({ instanceId: session.id, ...event }, 'messaging history status');
+    });
     sock.ev.on('chats.upsert', (chats) => {
       mergeChats(session, chats).catch((err) =>
         logger.error({ instanceId: session.id, err: err.message }, 'chat upsert handler crashed')
@@ -512,6 +559,16 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     sock.ev.on('chats.update', (chats) => {
       mergeChats(session, chats).catch((err) =>
         logger.error({ instanceId: session.id, err: err.message }, 'chat update handler crashed')
+      );
+    });
+    sock.ev.on('contacts.upsert', (contacts) => {
+      mergeContacts(session, contacts).catch((err) =>
+        logger.error({ instanceId: session.id, err: err.message }, 'contact upsert handler crashed')
+      );
+    });
+    sock.ev.on('contacts.update', (contacts) => {
+      mergeContacts(session, contacts).catch((err) =>
+        logger.error({ instanceId: session.id, err: err.message }, 'contact update handler crashed')
       );
     });
   }
@@ -591,13 +648,13 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
   }
 
   async function handleMessagesUpsert(session, event) {
-    if (event.type !== 'notify') return;
+    const live = event.type === 'notify';
     for (const msg of event.messages || []) {
       try {
         const data = await dataFromMessage(session, msg);
         if (!data) continue;
         await appendHistory(session, data);
-        emit(session, msg.key?.fromMe ? 'message.sent' : 'message', data);
+        if (live) emit(session, msg.key?.fromMe ? 'message.sent' : 'message', data);
         logger.debug({ instanceId: session.id, messageId: data.id }, 'message relayed');
       } catch (err) {
         logger.error({ instanceId: session.id, err: err.message }, 'failed handling message');
