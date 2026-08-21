@@ -748,7 +748,11 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       },
       version,
       logger,
-      browser: Browsers.macOS('Desktop'),
+      // The generic Desktop identity is currently rejected during new-device
+      // registration (connectionClosed/428 before WhatsApp emits a QR). Chrome
+      // pairs reliably and still receives full history with the sync options
+      // below enabled.
+      browser: Browsers.macOS('Chrome'),
       markOnlineOnConnect: false,
       keepAliveIntervalMs: 30_000,
       syncFullHistory: true,
