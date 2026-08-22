@@ -38,6 +38,10 @@ The Meta **Cloud API** channel stays as-is; QR accounts are additive.
   explicitly opts into all history chunks (`shouldSyncHistoryMessage: () => true`).
   This keeps QR generation reliable while still caching `FULL` history payloads
   when WhatsApp sends them.
+- **Identity normalization:** every instance keeps a durable LID-to-phone alias
+  directory in the configured auth store. History mappings, contact metadata,
+  realtime alt-JIDs, `lid-mapping.update`, and Baileys' persisted signal mapping
+  are reconciled into cached chats/messages without replacing the linked session.
 - **Outbound (app→WhatsApp):** `POST /instances/:id/messages/text` with
   `x-api-key: $BRIDGE_TOKEN`.
 - **Single-instance invariant:** exactly one process; Baileys holds one live
@@ -133,6 +137,8 @@ AUTH_STORE=disk \
 npm start
 # → GET http://localhost:8080/health  →  {"ok":true,"accounts":0,"uptime":...}
 ```
+
+Run the focused identity regression suite with `npm test`.
 
 Then `POST /instances {name,webhookUrl}` with `x-api-key: dev-token`, poll
 `/instances/:id/qr`, render `/instances/:id/qr.png`, and scan it with a

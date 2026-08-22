@@ -5,6 +5,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   getContentType,
   isHostedLidUser,
+  isHostedPnUser,
   isLidUser,
   isPnUser,
   normalizeMessageContent,
@@ -16,6 +17,15 @@ import { join } from 'node:path';
 import { jsonrepair } from 'jsonrepair';
 import QRCode from 'qrcode';
 import { makeAuthState } from './authState.mjs';
+import {
+  JidIdentityDirectory,
+  collectCachedLids,
+  isLidIdentityJid,
+  normalizeCachedChats,
+  normalizeCachedHistory,
+  normalizeIdentityJid,
+  rememberCachedIdentities,
+} from './identity.mjs';
 
 const MAX_BACKOFF_MS = 60_000;
 const BASE_BACKOFF_MS = 2_000;
@@ -29,7 +39,11 @@ const BACKFILL_DEFAULT_COUNT = 50;
 function isIndividualJid(jid) {
   return Boolean(
     typeof jid === 'string' &&
-      (isPnUser(jid) || isLidUser(jid) || isHostedLidUser(jid) || jid.endsWith(S_WHATSAPP_NET))
+      (isPnUser(jid) ||
+        isHostedPnUser(jid) ||
+        isLidUser(jid) ||
+        isHostedLidUser(jid) ||
+        jid.endsWith(S_WHATSAPP_NET))
   );
 }
 
@@ -45,6 +59,8 @@ function messageKeyForHistory(msg) {
     remoteJid: msg.key.remoteJid,
     fromMe: Boolean(msg.key.fromMe),
     ...(msg.key.participant ? { participant: msg.key.participant } : {}),
+    ...(msg.key.remoteJidAlt ? { remoteJidAlt: msg.key.remoteJidAlt } : {}),
+    ...(msg.key.participantAlt ? { participantAlt: msg.key.participantAlt } : {}),
   };
 }
 
@@ -168,30 +184,32 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
   let cleanupTimer = null;
 
   function rememberJidMapping(session, lid, pn) {
-    if (!session || !lid || !pn || !isLidUser(lid) || !isPnUser(pn)) return;
-    session.jidMap ||= new Map();
-    session.jidMap.set(lid, pn);
+    if (!session?.identities) return false;
+    const changed = session.identities.remember(lid, pn);
+    if (changed) session.identityDirty = true;
+    return changed;
   }
 
   function rememberMappingsFromHistory(session, event) {
+    let changed = false;
     for (const item of event?.lidPnMappings || []) {
-      rememberJidMapping(session, item?.lid, item?.pn);
+      changed = rememberJidMapping(session, item?.lid, item?.pn) || changed;
     }
     for (const item of [...(event?.contacts || []), ...(event?.chats || [])]) {
-      rememberJidMapping(session, item?.id || item?.lidJid || item?.accountLid, item?.pnJid || item?.phoneNumber);
-      rememberJidMapping(session, item?.lidJid || item?.accountLid, item?.id || item?.pnJid || item?.phoneNumber);
+      const learned = session.identities.rememberRecord(item);
+      changed = learned || changed;
+      if (learned) session.identityDirty = true;
     }
+    for (const message of historyMessagesFromEvent(event)) {
+      const learned = session.identities.rememberMessage(message);
+      changed = learned || changed;
+      if (learned) session.identityDirty = true;
+    }
+    return changed;
   }
 
   function resolveChatJid(session, jid) {
-    if (!jid || typeof jid !== 'string') return '';
-    if (isPnUser(jid) || jid.endsWith(S_WHATSAPP_NET)) return jid;
-    return session?.jidMap?.get(jid) || jid;
-  }
-
-  function phoneFromChatJid(session, jid) {
-    const resolved = resolveChatJid(session, jid);
-    return digitsFromJid(resolved) || digitsFromJid(jid);
+    return session?.identities?.resolve(jid) || normalizeIdentityJid(jid);
   }
 
   function publicView(session) {
@@ -265,6 +283,63 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
 
   function chatsDiskPath(instanceId) {
     return join(config.authDiskDir, 'chats', `${safeSegment(instanceId)}.json`);
+  }
+
+  function identitiesKey(instanceId) {
+    return `${config.authStatePrefix}:identities:${instanceId}`;
+  }
+
+  function identitiesDiskPath(instanceId) {
+    return join(config.authDiskDir, 'identities', `${safeSegment(instanceId)}.json`);
+  }
+
+  async function readIdentities(instanceId) {
+    try {
+      const raw =
+        config.authStore === 'redis'
+          ? await redis.get(identitiesKey(instanceId))
+          : await readFile(identitiesDiskPath(instanceId), 'utf8').catch((err) => {
+              if (err.code === 'ENOENT') return null;
+              throw err;
+            });
+      return new JidIdentityDirectory(raw ? JSON.parse(raw) : undefined);
+    } catch (err) {
+      logger.warn({ instanceId, err: err.message }, 'identity map read failed');
+      return new JidIdentityDirectory();
+    }
+  }
+
+  async function writeIdentities(instanceId, directory) {
+    const body = JSON.stringify(directory.toJSON());
+    if (config.authStore === 'redis') {
+      await redis.set(identitiesKey(instanceId), body);
+      return;
+    }
+    await mkdir(join(config.authDiskDir, 'identities'), { recursive: true });
+    await atomicWrite(identitiesDiskPath(instanceId), body);
+  }
+
+  async function deleteIdentities(instanceId) {
+    if (config.authStore === 'redis') {
+      await redis.del(identitiesKey(instanceId));
+      return;
+    }
+    await rm(identitiesDiskPath(instanceId), { force: true });
+  }
+
+  async function flushIdentities(session) {
+    if (!session?.identityDirty) return;
+    const revision = session.identities.revision;
+    const snapshot = new JidIdentityDirectory(session.identities.toJSON());
+    const previous = session.identityWrite || Promise.resolve();
+    const pending = previous.catch(() => undefined).then(() => writeIdentities(session.id, snapshot));
+    session.identityWrite = pending;
+    await pending;
+    if (session.identities.revision === revision) {
+      session.identityDirty = false;
+      return;
+    }
+    await flushIdentities(session);
   }
 
   async function readHistory(instanceId) {
@@ -348,6 +423,76 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     }
   }
 
+  async function reconcileIdentityCaches(session) {
+    const [history, chats] = await Promise.all([
+      session.history || readHistory(session.id),
+      session.chats || readChats(session.id),
+    ]);
+    if (rememberCachedIdentities(session.identities, chats, history)) {
+      session.identityDirty = true;
+    }
+    const normalizedHistory = normalizeCachedHistory(session.identities, history);
+    const normalizedChats = normalizeCachedChats(session.identities, chats);
+    session.history = normalizedHistory.messages;
+    session.chats = normalizedChats.chats;
+    await Promise.all([
+      normalizedHistory.changed ? writeHistory(session.id, normalizedHistory.messages) : undefined,
+      normalizedChats.changed ? writeChats(session.id, normalizedChats.chats) : undefined,
+      flushIdentities(session),
+    ]);
+    return normalizedHistory.changed || normalizedChats.changed;
+  }
+
+  async function ensureJidIdentity(session, jid, alternateJid) {
+    if (!session?.identities) return { jid: normalizeIdentityJid(jid), phone: '' };
+    if (session.identities.remember(jid, alternateJid)) session.identityDirty = true;
+    let resolved = session.identities.resolve(jid);
+    let phone = session.identities.phone(jid);
+    const normalized = normalizeIdentityJid(jid);
+    if (!phone && isLidIdentityJid(normalized)) {
+      try {
+        const pn = await session.sock?.signalRepository?.lidMapping?.getPNForLID(normalized);
+        if (pn && rememberJidMapping(session, normalized, pn)) {
+          resolved = session.identities.resolve(normalized);
+          phone = session.identities.phone(normalized);
+        }
+      } catch (err) {
+        logger.debug({ instanceId: session.id, err: err.message }, 'LID reverse lookup missed');
+      }
+    }
+    return { jid: resolved, phone };
+  }
+
+  async function hydrateIdentityMappings(session) {
+    if (!session?.sock?.signalRepository?.lidMapping) return 0;
+    const [history, chats] = await Promise.all([
+      session.history || readHistory(session.id),
+      session.chats || readChats(session.id),
+    ]);
+    session.history = history;
+    session.chats = chats;
+    if (rememberCachedIdentities(session.identities, chats, history)) {
+      session.identityDirty = true;
+      await flushIdentities(session);
+    }
+    const lids = collectCachedLids(chats, history).filter((jid) => !session.identities.has(jid));
+    let learned = 0;
+    for (let index = 0; index < lids.length; index += 200) {
+      const pairs = await session.sock.signalRepository.lidMapping.getPNsForLIDs(
+        lids.slice(index, index + 200)
+      );
+      for (const pair of pairs || []) {
+        if (rememberJidMapping(session, pair?.lid, pair?.pn)) learned += 1;
+      }
+    }
+    if (learned > 0) {
+      await flushIdentities(session);
+      await reconcileIdentityCaches(session);
+      logger.info({ instanceId: session.id, learned }, 'persisted LID identities hydrated');
+    }
+    return learned;
+  }
+
   async function archivedInstanceIds() {
     const ids = new Set();
     if (config.authStore === 'redis') {
@@ -397,12 +542,17 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     return Number.isNaN(date.valueOf()) ? new Date().toISOString() : date.toISOString();
   }
 
-  function chatRecordFromWa(session, chat) {
+  async function chatRecordFromWa(session, chat) {
     const id = chat?.id || chat?.jid || chat?.remoteJid || '';
-    rememberJidMapping(session, chat?.lidJid || chat?.accountLid || id, chat?.pnJid || chat?.phoneNumber);
+    if (session.identities.rememberRecord(chat)) session.identityDirty = true;
     if (!isIndividualJid(id)) return null;
-    const resolvedId = resolveChatJid(session, id);
-    const phone = phoneFromChatJid(session, id);
+    const identity = await ensureJidIdentity(
+      session,
+      id,
+      chat?.pnJid || chat?.phoneNumber || chat?.lidJid || chat?.accountLid
+    );
+    const resolvedId = identity.jid;
+    const phone = identity.phone;
     if (!phone) return null;
     const latestWrapped = Array.isArray(chat.messages) ? chat.messages.at(-1) : null;
     const latestMessage = latestWrapped?.message || latestWrapped;
@@ -439,7 +589,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     let changed = 0;
     let latestImported = 0;
     for (const row of rows) {
-      const next = chatRecordFromWa(session, row);
+      const next = await chatRecordFromWa(session, row);
       if (!next) continue;
       const existing = byPhone.get(next.phone);
       byPhone.set(next.phone, {
@@ -465,7 +615,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       .sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt))
       .slice(0, CHAT_LIMIT);
     session.chats = sorted;
-    await writeChats(session.id, sorted);
+    await Promise.all([writeChats(session.id, sorted), flushIdentities(session)]);
     if (latestImported > 0) {
       logger.info({ instanceId: session.id, imported: latestImported }, 'latest chat messages cached');
     }
@@ -479,10 +629,15 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     let changed = 0;
     for (const row of rows) {
       const id = row?.id || row?.jid || row?.remoteJid || '';
-      rememberJidMapping(session, row?.lidJid || row?.accountLid || id, row?.pnJid || row?.phoneNumber);
+      if (session.identities.rememberRecord(row)) session.identityDirty = true;
       if (!isIndividualJid(id)) continue;
-      const resolvedId = resolveChatJid(session, id);
-      const phone = phoneFromChatJid(session, id);
+      const identity = await ensureJidIdentity(
+        session,
+        id,
+        row?.pnJid || row?.phoneNumber || row?.lid || row?.lidJid || row?.accountLid
+      );
+      const resolvedId = identity.jid;
+      const phone = identity.phone;
       if (!phone) continue;
       const name = String(row.name || row.notify || row.verifiedName || '').trim();
       if (!name) continue;
@@ -508,12 +663,15 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
         changed += 1;
       }
     }
-    if (changed === 0) return 0;
+    if (changed === 0) {
+      await flushIdentities(session);
+      return 0;
+    }
     const sorted = [...byPhone.values()]
       .sort((a, b) => b.lastMessageAt.localeCompare(a.lastMessageAt))
       .slice(0, CHAT_LIMIT);
     session.chats = sorted;
-    await writeChats(session.id, sorted);
+    await Promise.all([writeChats(session.id, sorted), flushIdentities(session)]);
     return changed;
   }
 
@@ -551,8 +709,10 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     if (!msg.message) return null;
     const remoteJid = msg.key?.remoteJid || '';
     if (!isIndividualJid(remoteJid)) return null;
-    const resolvedJid = resolveChatJid(session, remoteJid);
-    const chatPhone = phoneFromChatJid(session, remoteJid);
+    if (session.identities.rememberMessage(msg)) session.identityDirty = true;
+    const chatIdentity = await ensureJidIdentity(session, remoteJid, msg.key?.remoteJidAlt);
+    const resolvedJid = chatIdentity.jid;
+    const chatPhone = chatIdentity.phone;
     if (!chatPhone) return null;
     const { text, media } = extractContent(msg.message);
     if (!text && !media) return null;
@@ -574,13 +734,17 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       }
     }
     const pushName = msg.pushName || options.pushName || null;
+    const rawSender = msg.key?.participant || remoteJid;
+    const alternateSender = msg.key?.participantAlt || msg.key?.remoteJidAlt;
+    const senderIdentity = await ensureJidIdentity(session, rawSender, alternateSender);
     return {
       id: messageId,
       chatJid: resolvedJid,
       ...(resolvedJid !== remoteJid ? { sourceChatJid: remoteJid } : {}),
       chatPhone,
-      sender: msg.key?.participant || remoteJid,
-      senderPhone: digitsFromJid(msg.key?.participant || remoteJid),
+      sender: senderIdentity.jid,
+      ...(senderIdentity.jid !== rawSender ? { sourceSenderJid: rawSender } : {}),
+      senderPhone: senderIdentity.phone,
       pushName,
       text,
       body: text,
@@ -625,6 +789,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
 
   async function handleHistorySet(session, event) {
     rememberMappingsFromHistory(session, event || {});
+    await flushIdentities(session);
     const names = contactNamesFromHistory(session, event || {});
     const chatCount = await mergeChats(session, event?.chats || []);
     let imported = 0;
@@ -641,6 +806,8 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
         logger.warn({ instanceId: session.id, err: err.message }, 'history message import failed');
       }
     }
+    await flushIdentities(session);
+    await reconcileIdentityCaches(session);
     logger.info(
       {
         instanceId: session.id,
@@ -667,8 +834,19 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     const session = sessions.get(id);
     if (!session && !(await archivedInstanceIds()).has(id)) return null;
     const history = session?.history || (await readHistory(id));
-    if (session) session.history = history;
-    return history.slice(-Math.min(Math.max(limit, 1), HISTORY_LIMIT));
+    const directory = session?.identities || (await readIdentities(id));
+    if (rememberCachedIdentities(directory, [], history)) {
+      if (session) {
+        session.identityDirty = true;
+        await flushIdentities(session);
+      } else {
+        await writeIdentities(id, directory);
+      }
+    }
+    const normalized = normalizeCachedHistory(directory, history);
+    if (session) session.history = normalized.messages;
+    if (normalized.changed) await writeHistory(id, normalized.messages);
+    return normalized.messages.slice(-Math.min(Math.max(limit, 1), HISTORY_LIMIT));
   }
 
   function historyCursorKey(message) {
@@ -690,10 +868,8 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
   }
 
   async function listHistoryPage(id, { cursor, limit = 150 } = {}) {
-    const session = sessions.get(id);
-    if (!session && !(await archivedInstanceIds()).has(id)) return null;
-    const history = session?.history || (await readHistory(id));
-    if (session) session.history = history;
+    const history = await listMessages(id, HISTORY_LIMIT);
+    if (!history) return null;
     const before = decodeHistoryCursor(cursor);
     const eligible = history
       .filter((message) => !before || historyCursorKey(message) < before)
@@ -714,18 +890,36 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
   async function listChats(id, { includeMessages = false, limit = 500 } = {}) {
     const history = await listMessages(id, HISTORY_LIMIT);
     if (!history) return null;
-    const storedChats = sessions.get(id)?.chats || (await readChats(id));
-    if (sessions.get(id)) sessions.get(id).chats = storedChats;
-    const chats = new Map(storedChats.map((chat) => [chat.phone, { ...chat, messages: [] }]));
+    const session = sessions.get(id);
+    const directory = session?.identities || (await readIdentities(id));
+    const storedChats = session?.chats || (await readChats(id));
+    if (rememberCachedIdentities(directory, storedChats, history)) {
+      if (session) {
+        session.identityDirty = true;
+        await flushIdentities(session);
+      } else {
+        await writeIdentities(id, directory);
+      }
+    }
+    const normalizedChats = normalizeCachedChats(directory, storedChats);
+    if (session) session.chats = normalizedChats.chats;
+    if (normalizedChats.changed) await writeChats(id, normalizedChats.chats);
+    const chats = new Map(
+      normalizedChats.chats
+        .filter((chat) => chat.phone)
+        .map((chat) => [chat.phone, { ...chat, messages: [] }])
+    );
     for (const message of history) {
-      const phone = message.chatPhone || digitsFromJid(message.chatJid);
+      const phone =
+        message.chatPhone || directory.phone(message.sourceChatJid || message.chatJid);
       if (!phone) continue;
+      const chatJid = directory.resolve(message.sourceChatJid || message.chatJid);
       const existing =
         chats.get(phone) ||
         {
-          id: message.chatJid,
-          chatId: message.chatJid,
-          chatJid: message.chatJid,
+          id: chatJid,
+          chatId: chatJid,
+          chatJid,
           chatPhone: phone,
           phone,
           name: message.pushName || phone,
@@ -879,9 +1073,28 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     }
   }
 
+  async function handleLidMappingUpdate(session, mapping) {
+    if (!rememberJidMapping(session, mapping?.lid, mapping?.pn)) return;
+    await flushIdentities(session);
+    await reconcileIdentityCaches(session);
+  }
+
+  function scheduleIdentityHydration(session) {
+    if (session.deleted || session.identityHydration) return;
+    session.identityHydration = hydrateIdentityMappings(session)
+      .catch((err) =>
+        logger.warn({ instanceId: session.id, err: err.message }, 'identity hydration failed')
+      )
+      .finally(() => {
+        session.identityHydration = null;
+      });
+  }
+
   async function startSocket(session) {
     const auth = await makeAuthState({ config, redis, accountId: session.id, logger });
     session.auth = auth;
+    if (session.identities.rememberRecord(auth.state.creds.me)) session.identityDirty = true;
+    await flushIdentities(session);
     const isNewPairing = !auth.state.creds.registered;
     let version;
     try {
@@ -931,6 +1144,11 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
     sock.ev.on('messaging-history.status', (event) => {
       logger.info({ instanceId: session.id, ...event }, 'messaging history status');
     });
+    sock.ev.on('lid-mapping.update', (mapping) => {
+      handleLidMappingUpdate(session, mapping).catch((err) =>
+        logger.error({ instanceId: session.id, err: err.message }, 'LID mapping handler crashed')
+      );
+    });
     sock.ev.on('chats.upsert', (chats) => {
       mergeChats(session, chats).catch((err) =>
         logger.error({ instanceId: session.id, err: err.message }, 'chat upsert handler crashed')
@@ -951,6 +1169,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
         logger.error({ instanceId: session.id, err: err.message }, 'contact update handler crashed')
       );
     });
+    scheduleIdentityHydration(session);
   }
 
   async function handleConnectionUpdate(session, update) {
@@ -972,11 +1191,16 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       session.reconnectAttempts = 0;
       session.connectedAt = new Date().toISOString();
       const meId = session.sock?.user?.id || session.auth?.state?.creds?.me?.id;
+      if (session.identities.rememberRecord(session.sock?.user || session.auth?.state?.creds?.me)) {
+        session.identityDirty = true;
+        await flushIdentities(session);
+      }
       session.phone = digitsFromJid(meId);
       setStatus(session, 'connected');
       emit(session, 'instance.ready', {
         phoneNumber: session.phone ? `+${session.phone}` : null,
       });
+      scheduleIdentityHydration(session);
       if (session.socketMode === 'pairing' && !session.historyReconnectTimer) {
         const pairingSocket = session.sock;
         session.historyReconnectTimer = setTimeout(() => {
@@ -1043,6 +1267,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
 
   async function handleMessagesUpsert(session, event) {
     const live = event.type === 'notify';
+    const identityRevision = session.identities.revision;
     for (const msg of event.messages || []) {
       try {
         const data = await dataFromMessage(session, msg);
@@ -1053,6 +1278,10 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       } catch (err) {
         logger.error({ instanceId: session.id, err: err.message }, 'failed handling message');
       }
+    }
+    if (session.identityDirty || session.identities.revision !== identityRevision) {
+      await flushIdentities(session);
+      await reconcileIdentityCaches(session);
     }
   }
 
@@ -1072,6 +1301,7 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       if (options.persist !== false) await persistRegistry();
       return publicView(existing);
     }
+    const identities = await readIdentities(id);
     const session = {
       id,
       label: String(label || id).slice(0, 80),
@@ -1094,9 +1324,14 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       lastSendAt: 0,
       history: null,
       chats: null,
+      identities,
+      identityDirty: false,
+      identityWrite: null,
+      identityHydration: null,
     };
     sessions.set(id, session);
     if (options.persist !== false) await persistRegistry();
+    await reconcileIdentityCaches(session);
     logger.info({ instanceId: id }, 'instance created, booting socket');
     startSocket(session).catch((err) => {
       logger.error({ instanceId: id, err: err.message }, 'initial socket boot failed');
@@ -1153,6 +1388,11 @@ export function makeManager({ config, redis, registry, logger, dispatcher }) {
       await session.auth?.wipe();
     } catch (err) {
       logger.warn({ instanceId: id, err: err.message }, 'auth wipe failed during delete');
+    }
+    try {
+      await deleteIdentities(id);
+    } catch (err) {
+      logger.warn({ instanceId: id, err: err.message }, 'identity map delete failed');
     }
     emit(session, 'instance.logged_out', {});
     sessions.delete(id);
