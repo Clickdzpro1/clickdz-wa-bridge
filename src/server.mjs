@@ -251,6 +251,26 @@ export function createServer({ config, manager, logger, startTime }) {
             ? send(res, 202, out)
             : send(res, out.code || 400, { ok: false, error: out.error });
         }
+        if (method === 'POST' && segments.length === 3 && segments[2] === 'rebind') {
+          let body = {};
+          try {
+            body = await readJsonBody(req);
+          } catch (err) {
+            return send(res, 400, { ok: false, error: err.message });
+          }
+          if (!manager.get(id)) {
+            return send(res, 404, { ok: false, error: 'instance_not_found' });
+          }
+          const target = webhookUrl(body.webhookUrl, config.appWebhookUrl);
+          if (!target) return send(res, 400, { ok: false, error: 'invalid_webhook_url' });
+          const secret = randomBytes(32).toString('hex');
+          const view = await manager.create({
+            id,
+            webhookUrl: target,
+            webhookSecret: secret,
+          });
+          return send(res, 200, { ...view, webhookSecret: secret });
+        }
         if (method === 'POST' && segments.length === 3 && segments[2] === 'logout') {
           return send(res, 200, await manager.remove(id));
         }
